@@ -48,7 +48,7 @@ import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.j
  * session's process takes every turn through its prompt stream and ends only
  * when a client closes the session, when the server shuts down, or when a turn
  * needs options the CLI cannot take live (a rewind, a changed working
- * directory or effort), in which case it is replaced in one step.
+ * directory), in which case it is replaced in one step.
  */
 /** @typedef {import('@/shared/types.js').SessionProcessSnapshot} SessionProcessSnapshot */
 
@@ -753,7 +753,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
 /**
  * Whether a live process can take a turn with these options. What the CLI
  * cannot change live means a new process: a rewind (`resumeSessionAt` reloads
- * a truncated transcript), another working directory, another effort.
+ * a truncated transcript) and another working directory.
  * @param {Object} proc - Session process
  * @param {Object} turnOptions - This turn's options
  * @returns {boolean}
@@ -762,17 +762,14 @@ function canReuseProcess(proc, turnOptions) {
   if (turnOptions.resumeAnchorId || turnOptions.resumeFromScratch) {
     return false;
   }
-  if (turnOptions.cwd && proc.cwd && turnOptions.cwd !== proc.cwd) {
-    return false;
-  }
-  const effort = resolveClaudeEffort(turnOptions.model, turnOptions.effort, turnOptions.effortModels);
-  return effort === proc.effort;
+  return !turnOptions.cwd || !proc.cwd || turnOptions.cwd === proc.cwd;
 }
 
 /**
  * Applies a turn's options to a live process through the SDK's control
- * channel: model and permission mode, plus the tool lists the approval gate
- * reads. Entries remembered through "always allow" during the process stay.
+ * channel: model, permission mode and effort (the CLI's `/effort`, session-
+ * scoped), plus the tool lists the approval gate reads. Entries remembered
+ * through "always allow" during the process stay.
  * @param {Object} proc - Session process
  * @param {Object} turnOptions - This turn's options
  */
@@ -789,6 +786,17 @@ async function applyLiveOptions(proc, turnOptions) {
   if (nextMode !== (current.permissionMode || 'default')) {
     await proc.query.setPermissionMode(nextMode);
     current.permissionMode = next.permissionMode;
+  }
+
+  const nextUltracode = Boolean(next.settings?.ultracode);
+  if ((next.effort ?? null) !== (current.effort ?? null) || nextUltracode !== Boolean(current.settings?.ultracode)) {
+    await proc.query.applyFlagSettings({
+      effortLevel: next.effort ?? null,
+      ultracode: nextUltracode || null,
+      enableWorkflows: nextUltracode || null,
+    });
+    current.effort = next.effort;
+    current.settings = next.settings;
   }
 
   const allowed = new Set([...(next.allowedTools || []), ...proc.remembered]);
@@ -819,7 +827,6 @@ async function launchSessionProcess(spec) {
     resumed: Boolean(turnOptions.providerSessionId) && !turnOptions.resumeFromScratch,
     sessionCreatedSent: false,
     cwd: turnOptions.cwd || null,
-    effort: resolveClaudeEffort(turnOptions.model, turnOptions.effort, turnOptions.effortModels),
     sdkOptions,
     remembered: new Set(),
     abortController: new AbortController(),

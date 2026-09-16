@@ -389,9 +389,10 @@ busy with that work: two processes resumed the same transcript and both appended
   turn's `result`, not when the process ends.
 - `abort()` interrupts the turn and keeps the process. `close()` ends it: turn interrupted, stdin
   closed, and the CLI killed after `CLAUDE_CLOSE_GRACE_MS` (10 s) if it has not left.
-- Model and permission mode change on the live process through the SDK's control channel. A turn
-  that edits a sent message (`resumeSessionAt`), or changes the working directory or the effort,
-  replaces the process in one step: the old one is closed before the new one starts.
+- Model, permission mode and effort change on the live process through the SDK's control channel
+  (`setModel`, `setPermissionMode`, `applyFlagSettings({ effortLevel })`). A turn that edits a sent
+  message (`resumeSessionAt`) or changes the working directory replaces the process in one step: the
+  old one is closed before the new one starts.
 - `processes` exposes the live processes (`get`, `list`, `onChange`, `closeAll`); the websocket
   gateway broadcasts every change as `session_process`, and the server closes them all on shutdown.
 - Callers with no app session (the agent and git routes, over SSE) get a process for one turn,

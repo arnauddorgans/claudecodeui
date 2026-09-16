@@ -45,6 +45,7 @@ class FakeQuery {
   interrupts = 0;
   models: string[] = [];
   modes: string[] = [];
+  flagSettings: AnyRecord[] = [];
   exited = false;
   onInput: ((message: AnyRecord) => void) | null = null;
   readonly options: AnyRecord;
@@ -82,6 +83,7 @@ class FakeQuery {
   async interrupt(): Promise<void> { this.interrupts += 1; }
   async setModel(model: string): Promise<void> { this.models.push(model); }
   async setPermissionMode(mode: string): Promise<void> { this.modes.push(mode); }
+  async applyFlagSettings(settings: AnyRecord): Promise<void> { this.flagSettings.push(settings); }
 
   [Symbol.asyncIterator]() {
     return this.output.stream[Symbol.asyncIterator]();
@@ -223,17 +225,19 @@ test('editing a sent message replaces the process', async () => {
   await closeClaudeSDKSession('app-3');
 });
 
-test('model and permission mode change on the live process', async () => {
+test('model, permission mode and effort change on the live process', async () => {
   const queries = installFakeSdk();
   const writer = createWriter();
   const context = createContext();
 
   await queryClaudeSDK('hello', { sessionId: 'app-4', model: 'sonnet' }, writer, context);
-  await queryClaudeSDK('again', { sessionId: 'app-4', model: 'opus', permissionMode: 'plan' }, writer, context);
+  await queryClaudeSDK('again', { sessionId: 'app-4', model: 'sonnet', permissionMode: 'plan', effort: 'high' }, writer, context);
+  await queryClaudeSDK('third', { sessionId: 'app-4', model: 'sonnet', permissionMode: 'plan', effort: 'high' }, writer, context);
 
   assert.equal(queries.length, 1);
-  assert.deepEqual(queries[0].models, ['opus']);
+  assert.deepEqual(queries[0].models, []);
   assert.deepEqual(queries[0].modes, ['plan']);
+  assert.deepEqual(queries[0].flagSettings, [{ effortLevel: 'high', ultracode: null, enableWorkflows: null }], 'applied once, not on the unchanged turn');
   await closeClaudeSDKSession('app-4');
 });
 
