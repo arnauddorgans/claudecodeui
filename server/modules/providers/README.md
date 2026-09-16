@@ -397,3 +397,11 @@ busy with that work: two processes resumed the same transcript and both appended
   gateway broadcasts every change as `session_process`, and the server closes them all on shutdown.
 - Callers with no app session (the agent and git routes, over SSE) get a process for one turn,
   ended at its `result`.
+- **`SESSION_PROCESS_LIFETIME`** (`shared/session-process-lifetime.ts`) chooses the behaviour, for the
+  chat process and the terminal's PTY alike. `classic`, the default, keeps what CloudCLI always did: a
+  process per turn, held after its `result` only while background work is outstanding (a backgrounded
+  `Bash`, `Monitor`, `ScheduleWakeup`, `CronCreate`, `TaskCreate`) and at most
+  `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` of silence, replaced by the next turn; a PTY with no client is
+  killed after `PTY_SESSION_TIMEOUT_MS` (30 minutes, `0` for never). `forever` is everything above.
+  In both modes a session never has two processes: the next turn waits for the previous process to be
+  gone before starting its own.

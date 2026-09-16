@@ -5,6 +5,7 @@ import path from 'node:path';
 import pty, { type IPty } from 'node-pty';
 import { WebSocket, type RawData } from 'ws';
 
+import { resolvePtySessionTimeoutMs, resolveSessionProcessLifetime } from '@/shared/session-process-lifetime.js';
 import { parseIncomingJsonObject } from '@/shared/utils.js';
 
 type ShellIncomingMessage = {
@@ -32,7 +33,14 @@ type PtySessionEntry = {
 };
 
 const ptySessionsMap = new Map<string, PtySessionEntry>();
-const PTY_SESSION_TIMEOUT = 30 * 60 * 1000;
+/**
+ * How long a PTY outlives its last client. `SESSION_PROCESS_LIFETIME=forever`
+ * keeps it until its shell exits or a client closes it; otherwise
+ * `PTY_SESSION_TIMEOUT_MS`, 30 minutes by default, `0` for never.
+ */
+function ptySessionTimeoutMs(): number {
+  return resolveSessionProcessLifetime() === 'forever' ? 0 : resolvePtySessionTimeoutMs();
+}
 const SHELL_URL_PARSE_BUFFER_LIMIT = 32768;
 const ANSI_ESCAPE_SEQUENCE_REGEX = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g;
 const TRAILING_URL_PUNCTUATION_REGEX = /[)\]}>.,;:!?]+$/;
@@ -603,6 +611,11 @@ export function handleShellConnection(
     session.ws = null;
     if (session.timeoutId) {
       clearTimeout(session.timeoutId);
+      session.timeoutId = null;
+    }
+    const timeoutMs = ptySessionTimeoutMs();
+    if (timeoutMs === 0) {
+      return;
     }
     session.timeoutId = setTimeout(() => {
       // A reconnect may win just as this timer becomes runnable. Re-check the
@@ -613,7 +626,7 @@ export function handleShellConnection(
 
       session.pty.kill();
       ptySessionsMap.delete(ptySessionKey as string);
-    }, PTY_SESSION_TIMEOUT);
+    }, timeoutMs);
   });
 
   ws.on('error', (error) => {

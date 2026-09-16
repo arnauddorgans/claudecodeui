@@ -128,6 +128,13 @@ async function untilExited(query: FakeQuery): Promise<void> {
   }
 }
 
+/** Waits for a session's process to be announced: launching one reads config files, so it takes a moment. */
+async function untilProcess(sessionId: string): Promise<void> {
+  for (let i = 0; i < 200 && !getSessionProcess(sessionId); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 /** Installs a fake SDK that answers every prompt at once, and collects the queries it created. */
 function installFakeSdk(script: (query: FakeQuery) => void = (query) => { query.onInput = () => query.answer('sid-1'); }) {
   const queries: FakeQuery[] = [];
@@ -140,8 +147,13 @@ function installFakeSdk(script: (query: FakeQuery) => void = (query) => { query.
   return queries;
 }
 
+test.beforeEach(() => {
+  process.env.SESSION_PROCESS_LIFETIME = 'forever';
+});
+
 test.afterEach(() => {
   setClaudeQueryImplementation(null);
+  delete process.env.SESSION_PROCESS_LIFETIME;
 });
 
 test('two turns of a session go through one process, which lives on until closed', async () => {
@@ -188,7 +200,7 @@ test('abort interrupts the turn and keeps the process', async () => {
   const context = createContext();
 
   const turn = queryClaudeSDK('hello', { sessionId: 'app-2' }, writer, context);
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await untilProcess('app-2');
   assert.equal(await abortClaudeSDKSession('app-2'), true, 'abort returns once the CLI took the interrupt');
   assert.equal(queries[0].interrupts, 1);
   let turnSettled = false;
@@ -264,6 +276,7 @@ test('a process that dies under a turn reports the error and completes', async (
   const context = createContext();
 
   const turn = queryClaudeSDK('hello', { sessionId: 'app-6' }, writer, context);
+  await untilProcess('app-6');
   await new Promise((resolve) => setTimeout(resolve, 10));
   // The CLI goes away mid-turn.
   (queries[0] as unknown as { output: { end(): void } }).output.end();
@@ -272,4 +285,47 @@ test('a process that dies under a turn reports the error and completes', async (
   const complete = writer.frames.find((frame) => frame.kind === 'complete');
   assert.ok(complete, 'the client still gets a terminal complete');
   assert.equal(getSessionProcess('app-6'), null);
+});
+
+test('classic: every turn gets its own process, the previous one gone first', async () => {
+  process.env.SESSION_PROCESS_LIFETIME = 'classic';
+  const queries = installFakeSdk();
+  const writer = createWriter();
+  const context = createContext();
+
+  await queryClaudeSDK('hello', { sessionId: 'app-7' }, writer, context);
+  await untilExited(queries[0]);
+  assert.equal(queries[0].exited, true, 'let go at its result');
+  assert.equal(getSessionProcess('app-7'), null, 'classic processes are not announced');
+
+  await queryClaudeSDK('again', { sessionId: 'app-7' }, writer, context);
+  assert.equal(queries.length, 2);
+  assert.equal(queries[1].consumed.length, 1);
+});
+
+test('classic: a turn with background work holds its process, and the next turn replaces it', async () => {
+  process.env.SESSION_PROCESS_LIFETIME = 'classic';
+  const queries = installFakeSdk((query) => {
+    query.onInput = () => {
+      query.emit({ type: 'system', subtype: 'init', session_id: 'sid-8' });
+      query.emit({
+        type: 'assistant',
+        session_id: 'sid-8',
+        message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Bash', input: { command: 'npm run dev', run_in_background: true } }] },
+      });
+      query.emit({ type: 'result', subtype: 'success', session_id: 'sid-8' });
+    };
+  });
+  const writer = createWriter();
+  const context = createContext();
+
+  await queryClaudeSDK('start the server', { sessionId: 'app-8' }, writer, context);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(queries[0].exited, false, 'held for the background work');
+
+  queries[0].onInput = () => queries[0].answer('sid-8');
+  await queryClaudeSDK('and now?', { sessionId: 'app-8' }, writer, context);
+  assert.equal(queries.length, 2, 'the next turn gets a new process');
+  assert.equal(queries[0].exited, true, 'after the held one was closed');
+  await untilExited(queries[1]);
 });

@@ -36,16 +36,24 @@ import {
   notifyRunStopped,
   notifyUserIfEnabled
 } from '@/modules/notifications/index.js';
+import { CLASSIC_BG_WAIT_CEILING_MS, resolveSessionProcessLifetime } from '@/shared/session-process-lifetime.js';
 import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.js';
 /**
- * One Claude CLI process per app session, kept across turns.
+ * One Claude CLI process per app session.
  *
  * Every turn used to spawn its own `claude --resume` and the process was held
  * open afterwards only when the turn had started background work, up to a
  * ceiling. The next turn then spawned a second process and closed the first
  * one's stdin behind it, which does not stop a CLI still busy with that work:
  * two processes resumed the same transcript and both appended to it. Here a
- * session's process takes every turn through its prompt stream and ends only
+ * session never has more than one process: a turn that cannot reuse the live
+ * one closes it, and waits for it to be gone, before starting another.
+ *
+ * How long the process lives is `SESSION_PROCESS_LIFETIME`
+ * (`shared/session-process-lifetime.ts`). `classic` keeps what CloudCLI always
+ * did: the process is let go at the turn's `result`, held only while
+ * background work is outstanding, and replaced by the next turn. `forever`
+ * takes every turn through the same process's prompt stream, and ends it only
  * when a client closes the session, when the server shuts down, or when a turn
  * needs options the CLI cannot take live (a rewind, a changed working
  * directory), in which case it is replaced in one step.
@@ -63,7 +71,8 @@ const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEO
 // closed — before it is killed.
 const CLOSE_GRACE_MS = parseInt(process.env.CLAUDE_CLOSE_GRACE_MS, 10) || 10000;
 // Passed to the CLI as CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: how long it waits for
-// its background agents once stdin closes. Only a closing process gets there.
+// its background agents once stdin closes. A `forever` process only gets there
+// on close; a `classic` one at the end of every turn, as before.
 const BG_WAIT_ON_CLOSE_MS = 5000;
 // How long an abort waits for the interrupted turn's own `result` before handing
 // the session back; a `result` after that reads as background work reporting in.
@@ -235,7 +244,12 @@ function mapCliOptionsToSDK(options = {}) {
 
   // Forward all host env vars (e.g. ANTHROPIC_BASE_URL) to the subprocess.
   // Since SDK 0.2.113, options.env replaces process.env instead of overlaying it.
-  sdkOptions.env = { ...process.env, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(BG_WAIT_ON_CLOSE_MS) };
+  sdkOptions.env = {
+    ...process.env,
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(
+      resolveSessionProcessLifetime() === 'forever' ? BG_WAIT_ON_CLOSE_MS : CLASSIC_BG_WAIT_CEILING_MS
+    )
+  };
 
   // Resolve the executable eagerly on Windows because the SDK uses raw child_process.spawn,
   // which does not reliably follow npm's shell wrappers like cross-spawn does.
@@ -550,6 +564,36 @@ function extractCumulativeTokenBudget(sdkMessage) {
 }
 
 
+// Tool calls that leave work running past the end of a turn. Bash only counts
+// when it is explicitly backgrounded; the rest defer or watch work by nature.
+const DEFERRED_WORK_TOOLS = new Set(['Monitor', 'ScheduleWakeup', 'CronCreate', 'TaskCreate']);
+
+/**
+ * Detects tool calls that keep working after the turn's `result` arrives.
+ *
+ * In `classic` mode only turns that start background work hold their CLI
+ * process open; every other turn lets it exit at its `result`.
+ *
+ * @param {Object} sdkMessage - SDK stream message
+ * @returns {boolean} True when the message launches work that outlives the turn
+ */
+function startsBackgroundWork(sdkMessage) {
+  const content = sdkMessage?.message?.content;
+  if (!Array.isArray(content)) {
+    return false;
+  }
+
+  return content.some((block) => {
+    if (block?.type !== 'tool_use') {
+      return false;
+    }
+    if (block.name === 'Bash') {
+      return block.input?.run_in_background === true;
+    }
+    return DEFERRED_WORK_TOOLS.has(block.name);
+  });
+}
+
 /**
  * Builds the SDK user messages for one turn.
  *
@@ -693,7 +737,9 @@ async function loadMcpConfig(cwd) {
  * Runs one turn of a Claude session.
  *
  * A turn addressed to an app session goes to that session's process, started
- * here when there is none. Direct callers with no app session (the agent and
+ * here when there is none. In `classic` mode a process still alive from the
+ * previous turn (held for its background work) is closed first, as the next
+ * turn always replaced it. Direct callers with no app session (the agent and
  * git routes, over SSE) get a process for this one turn, ended at its result.
  *
  * Resolves when the turn's `result` arrives, when the turn is aborted, or when
@@ -709,7 +755,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // Callers pass the stable app session id; the SDK only understands the
   // provider-native id recorded on the session row.
   const providerSessionId = context.resolveProviderSessionId(sessionId);
-  const persistent = Boolean(sessionId) && !ws?.isSSEStreamWriter;
+  const lifetime = resolveSessionProcessLifetime();
+  const persistent = Boolean(sessionId) && !ws?.isSSEStreamWriter && lifetime === 'forever';
 
   const promptMessages = await buildPromptMessages(command, options.images, options.files, options.cwd);
 
@@ -728,7 +775,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   };
 
   let proc = sessionId ? sessionProcesses.get(sessionId) : undefined;
-  if (proc && (proc.closing || !canReuseProcess(proc, turnOptions))) {
+  if (proc && (proc.closing || !persistent || !canReuseProcess(proc, turnOptions))) {
     await closeSessionProcess(proc, 'replaced');
     proc = undefined;
   }
@@ -842,6 +889,9 @@ async function launchSessionProcess(spec) {
     turn: null,
     closing: false,
     exited: null,
+    // `classic` only: the timer that lets a process held for background work go
+    // after CLASSIC_BG_WAIT_CEILING_MS of silence.
+    holdTimer: null,
   };
 
   sdkOptions.abortController = proc.abortController;
@@ -1043,7 +1093,7 @@ async function runTurn(proc, promptMessages, ws, sessionSummary) {
 
   let finish;
   const done = new Promise((resolve) => { finish = resolve; });
-  proc.turn = { done, finish, aborted: false, completeSent: false, assistantBudgetSent: false };
+  proc.turn = { done, finish, aborted: false, completeSent: false, assistantBudgetSent: false, backgroundWork: false };
 
   console.log('Turn started for session:', proc.key || proc.providerSessionId || 'NEW');
   for (const message of promptMessages) {
@@ -1127,10 +1177,19 @@ function handleProcessMessage(proc, message) {
     }
   }
 
+  if (turn && startsBackgroundWork(message)) {
+    turn.backgroundWork = true;
+  }
+
   if (message.type !== 'result') {
+    if (proc.holdTimer) {
+      // Background activity after the turn: push the countdown back out.
+      holdProcess(proc);
+    }
     return;
   }
 
+  const backgroundWork = Boolean(turn?.backgroundWork);
   if (turn) {
     endTurn(proc, turn, {});
   } else {
@@ -1144,9 +1203,41 @@ function handleProcessMessage(proc, message) {
     });
   }
 
-  if (!proc.persistent) {
-    // One turn was all this process was for.
+  if (proc.persistent) {
+    return;
+  }
+  if (backgroundWork) {
+    // `classic`: work started during this turn is still running. Hold the
+    // process open so it can finish and report back; the ceiling is only a
+    // backstop for work that never reports.
+    holdProcess(proc);
+  } else {
+    // Either one turn was all this process was for, or the background work
+    // just reported in: let the CLI exit now.
+    clearHold(proc);
     proc.input.end();
+  }
+}
+
+/**
+ * `classic` only: arms (or re-arms) the countdown after which a process held
+ * for background work is let go.
+ * @param {Object} proc - Session process
+ */
+function holdProcess(proc) {
+  clearHold(proc);
+  proc.holdTimer = setTimeout(() => {
+    proc.holdTimer = null;
+    proc.input.end();
+  }, CLASSIC_BG_WAIT_CEILING_MS);
+  // Never let the hold keep the server process alive on its own.
+  proc.holdTimer.unref?.();
+}
+
+function clearHold(proc) {
+  if (proc.holdTimer) {
+    clearTimeout(proc.holdTimer);
+    proc.holdTimer = null;
   }
 }
 
@@ -1295,6 +1386,7 @@ async function closeSessionProcess(proc, reason) {
     return;
   }
   proc.closing = true;
+  clearHold(proc);
   console.log(`Closing Claude process for session ${proc.key || proc.providerSessionId || 'NEW'} (${reason})`);
 
   if (proc.turn) {
