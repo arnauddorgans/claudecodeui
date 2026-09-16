@@ -357,6 +357,8 @@ Useful tests in this repo:
 - `server/modules/providers/tests/mcp.test.ts`
 - `server/modules/providers/tests/skills.test.ts`
 - `server/modules/providers/tests/opencode-sessions.test.ts`
+- `server/modules/providers/tests/claude-session-process.test.ts` (the process, its tasks, `stopTask`)
+- `server/modules/providers/tests/claude-task-events.test.ts` (the SDK's task events as `task` messages)
 
 If you touch sessions or session synchronization, add or update focused tests
 alongside the implementation.
@@ -409,3 +411,38 @@ busy with that work: two processes resumed the same transcript and both appended
   nothing closes without a request.
   In both modes a session never has two processes: the next turn waits for the previous process to be
   gone before starting its own.
+
+## Claude: tasks and subagents
+
+The SDK announces the work a process runs beside the turn (the `Agent` tool's subagents, a
+backgrounded `Bash`, `Monitor`, ...) as system messages `task_started`, `task_updated`
+(a patch), `task_progress` and `task_notification` (the outcome, `completed` | `failed` |
+`stopped`, with a summary). `claude-sessions.provider.ts` (`normalizeClaudeTaskMessage`) maps each
+to one `task` message with the fields the event carries, in the shared status vocabulary (the
+patch's `killed` reads `stopped`, `paused` stays `running`); the SDK exposes no
+`background_tasks_changed` message, so nothing is done for one. Other system messages still
+produce nothing. The `task_notification` kind stays Codex's; Claude's history reader keeps folding
+the transcript's `<task-notification>` rows onto the `Agent` tool card, as before.
+
+The runtime keeps the process's record of every task it saw (`recordTask`, a `SessionProcessTask`
+per task id, kept after the task ended) and completes each outgoing `task` frame from it, so a
+patch frame still names the task's description, agent type and tool call. The record is
+`SessionProcessSnapshot.tasks`, and the process is announced again (`session_process`) when a task
+starts or ends, never on progress. `runtime.stopTask(sessionId, taskId)` (`IProviderRuntime`,
+optional) calls the SDK's `stopTask` on the session's process; the CLI answers with a
+`task_notification` of status `stopped`, which ends the record like any other. It refuses (false)
+a session without a live process or a task the process never reported.
+
+Each subagent's own transcript sits next to the session's, at
+`<claudeHome>/projects/<encoded cwd>/<providerSessionId>/subagents/agent-<agentId>.jsonl` with an
+`agent-<agentId>.meta.json` beside it (`agentType`, `description`, `toolUseId`).
+`IProviderSessions.listAgents` and `fetchAgentHistory` (optional, Claude only today) expose them
+over `GET /api/providers/sessions/:sessionId/agents` (`{ agents: SessionAgentSummary[] }`,
+`messageCount` counts the agent's user and assistant rows) and
+`GET /api/providers/sessions/:sessionId/agents/:agentId/messages`, which takes the same `limit` and
+`offset` as the session's `/messages` and answers with the same envelope: the agent's rows go
+through the same normalizer and page slicing (`normalizeTranscriptPage`), with `sessionId` set to
+the app session id. `agentId` must match `[A-Za-z0-9_-]{1,64}`; an unknown one is a 404
+`AGENT_NOT_FOUND`. Only the `<session>/subagents/` layout is listed: older CLIs dropped agent files
+next to the parent with nothing tying them to a session, though `fetchAgentHistory` still finds
+them by id.
