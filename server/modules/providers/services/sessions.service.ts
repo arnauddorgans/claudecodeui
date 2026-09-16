@@ -11,6 +11,7 @@ import type {
   FetchHistoryResult,
   LLMProvider,
   NormalizedMessage,
+  SessionProcessSnapshot,
 } from '@/shared/types.js';
 import { AppError, sliceTailPage } from '@/shared/utils.js';
 
@@ -137,6 +138,17 @@ export const sessionsService = {
     lastSeq: number;
   }> {
     return chatRunRegistry.listRunningRuns();
+  },
+
+  /**
+   * The processes providers keep alive between turns, one per session: a
+   * session can be idle yet still have its process, with background work of
+   * its own going on.
+   */
+  listSessionProcesses(): SessionProcessSnapshot[] {
+    return providerRegistry.listProviders().flatMap(
+      (provider) => provider.runtime.processes?.list() ?? [],
+    );
   },
 
   /**

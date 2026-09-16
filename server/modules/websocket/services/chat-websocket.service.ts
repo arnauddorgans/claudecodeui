@@ -18,6 +18,7 @@ import type {
   LLMProvider,
   ProviderPermissionDecision,
   ProviderRuntimeWriter,
+  SessionProcessSnapshot,
 } from '@/shared/types.js';
 import { parseIncomingJsonObject } from '@/shared/utils.js';
 
@@ -73,6 +74,10 @@ export type ProviderRuntimeGateway = {
     writer: ProviderRuntimeWriter,
   ): Promise<unknown>;
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
+  /** Ends the session's process, for providers that keep one between turns. */
+  close(provider: LLMProvider, sessionId: string): Promise<boolean>;
+  getSessionProcess(sessionId: string): SessionProcessSnapshot | null;
+  onSessionProcessChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
 };
@@ -438,9 +443,47 @@ async function handleChatAbort(
 }
 
 /**
+ * Handles `chat.close`: ends the session's process. A turn in flight is
+ * interrupted first and its terminal `complete` emitted here, as `chat.abort`
+ * does; everyone learns the process is gone from the `session_process`
+ * broadcast. Providers that keep no process between turns have nothing to
+ * close, which is not an error.
+ */
+async function handleChatClose(
+  ws: WebSocket,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies
+): Promise<void> {
+  const sessionId = readRequiredSessionId(data);
+  if (!sessionId) {
+    sendProtocolError(ws, 'SESSION_ID_REQUIRED', 'chat.close requires a sessionId.');
+    return;
+  }
+
+  const session = sessionsDb.getSessionById(sessionId);
+  if (!session) {
+    sendProtocolError(ws, 'SESSION_NOT_FOUND', `Session "${sessionId}" was not found.`, sessionId);
+    return;
+  }
+
+  const provider = session.provider as LLMProvider;
+  if (!dependencies.runtime.hasRuntime(provider)) {
+    sendProtocolError(ws, 'UNSUPPORTED_PROVIDER', `Provider "${provider}" is not available.`, sessionId);
+    return;
+  }
+
+  const wasRunning = chatRunRegistry.isProcessing(sessionId);
+  await dependencies.runtime.close(provider, sessionId);
+  if (wasRunning) {
+    chatRunRegistry.completeRun(sessionId, { exitCode: 0, aborted: true });
+  }
+}
+
+/**
  * Handles `chat.subscribe`: for each requested session, reports whether a run
  * is processing, re-attaches the live stream to this socket, replays missed
- * events (seq > lastSeq), and includes pending permission requests.
+ * events (seq > lastSeq), and includes pending permission requests and the
+ * session's process, when its provider keeps one alive between turns.
  *
  * This single message replaces the old `check-session-status`,
  * `get-pending-permissions`, and Claude-only writer reconnect flows.
@@ -488,6 +531,7 @@ function handleChatSubscribe(
       isProcessing,
       lastSeq: run?.lastSeq ?? 0,
       pendingPermissions,
+      process: dependencies.runtime.getSessionProcess(sessionId),
       timestamp: new Date().toISOString(),
     });
 
@@ -527,13 +571,14 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  * Inbound protocol (client to server):
  * - `chat.send`                { sessionId, content, options? }
  * - `chat.abort`               { sessionId }
+ * - `chat.close`               { sessionId }
  * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
  * - `chat.permission-response` { requestId, allow, updatedInput?, message?, rememberEntry? }
  *
  * Outbound protocol (server to client): every frame is `kind`-based — either
  * a provider `NormalizedMessage` (with `seq`) or a gateway event
- * (`chat_subscribed`, `session_upserted`, `loading_progress`,
- * `protocol_error`).
+ * (`chat_subscribed`, `session_upserted`, `session_process`,
+ * `loading_progress`, `protocol_error`).
  */
 /**
  * Runs a turn for a session with no client attached.
@@ -629,6 +674,9 @@ export function handleChatConnection(
           return;
         case 'chat.abort':
           await handleChatAbort(ws, data, dependencies);
+          return;
+        case 'chat.close':
+          await handleChatClose(ws, data, dependencies);
           return;
         case 'chat.subscribe':
           handleChatSubscribe(ws, data, dependencies);

@@ -740,7 +740,8 @@ router.get(
   '/sessions/running',
   asyncHandler(async (_req: Request, res: Response) => {
     const sessions = sessionsService.listRunningSessions();
-    res.json(createApiSuccessResponse({ sessions }));
+    const processes = sessionsService.listSessionProcesses();
+    res.json(createApiSuccessResponse({ sessions, processes }));
   }),
 );
 

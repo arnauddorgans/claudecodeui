@@ -3,6 +3,7 @@ import type { Server as HttpServer } from 'node:http';
 import { WebSocket, WebSocketServer, type VerifyClientCallbackSync } from 'ws';
 
 import { handleChatConnection } from '@/modules/websocket/services/chat-websocket.service.js';
+import { startSessionProcessBroadcast } from '@/modules/websocket/services/session-process-broadcast.service.js';
 import { verifyWebSocketClient } from '@/modules/websocket/services/websocket-auth.service.js';
 import { handlePluginWsProxy } from '@/modules/websocket/services/plugin-websocket-proxy.service.js';
 import { handleShellConnection } from '@/modules/websocket/services/shell-websocket.service.js';
@@ -90,6 +91,8 @@ export function createWebSocketServer(
       info: Parameters<VerifyClientCallbackSync<AuthenticatedWebSocketRequest>>[0]
     ) => verifyWebSocketClient(info, dependencies.verifyClient)),
   });
+
+  startSessionProcessBroadcast(dependencies.chat.runtime);
 
   wss.on('connection', (ws, request) => {
     attachWebSocketHeartbeat(ws);

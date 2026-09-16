@@ -204,6 +204,7 @@ export type MessageKind =
 export type GatewayEventKind =
   | 'chat_subscribed'
   | 'session_upserted'
+  | 'session_process'
   | 'loading_progress'
   | 'protocol_error';
 
@@ -249,6 +250,31 @@ export type SessionUpsertedEvent = {
     lastActivity: string;
   };
   project: SessionUpsertedProject | null;
+  timestamp: string;
+};
+
+/**
+ * A session's process as a provider that keeps one alive between turns
+ * reports it. `state` is `chat` while the process is up and `off` once it has
+ * gone; `turnActive` says whether a turn is in flight on it.
+ */
+export type SessionProcessSnapshot = {
+  sessionId: string;
+  provider: LLMProvider;
+  state: 'chat' | 'off';
+  /** Epoch milliseconds when the process started. */
+  since: number;
+  providerSessionId: string | null;
+  turnActive: boolean;
+};
+
+/**
+ * The `session_process` gateway event: a process started or ended for a
+ * session, so every client can show where the session lives. Built only by
+ * `modules/websocket/services/session-process-broadcast.service.ts`.
+ */
+export type SessionProcessEvent = SessionProcessSnapshot & {
+  kind: 'session_process';
   timestamp: string;
 };
 
@@ -426,6 +452,17 @@ export type ProviderPermissionDecision = {
 export type ProviderRuntimePermissionGateway = {
   resolve(requestId: string, decision: ProviderPermissionDecision): void;
   listPending(sessionId: string): unknown[];
+};
+
+/**
+ * The processes a provider keeps alive between turns, one per app session.
+ */
+export type ProviderRuntimeProcessGateway = {
+  get(sessionId: string): SessionProcessSnapshot | null;
+  list(): SessionProcessSnapshot[];
+  /** Called with a snapshot whenever a process starts or ends; returns the unsubscribe. */
+  onChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
+  closeAll(): Promise<void>;
 };
 
 /**

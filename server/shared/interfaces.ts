@@ -14,6 +14,7 @@ import type {
   ProviderSkillCreateInput,
   ProviderSkillRemoveInput,
   ProviderRuntimeContext,
+  ProviderRuntimeProcessGateway,
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
   UpsertProviderMcpServerInput,
@@ -35,6 +36,13 @@ export interface IProviderRuntime {
     context: ProviderRuntimeContext,
   ): Promise<unknown>;
   abort(sessionId: string): boolean | Promise<boolean>;
+  /**
+   * Ends the session's process. Only providers that keep one alive between
+   * turns implement it; for the others a session has nothing to close.
+   */
+  close?(sessionId: string): boolean | Promise<boolean>;
+  /** The processes the provider keeps alive between turns, when it does. */
+  processes?: ProviderRuntimeProcessGateway;
   permissions?: ProviderRuntimePermissionGateway;
 }
 

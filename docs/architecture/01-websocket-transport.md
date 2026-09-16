@@ -185,6 +185,7 @@ throws is answered with `INTERNAL_ERROR`.**
 | `chat.send` | `sessionId`, `content`, `options` | Resolves the session row, registers the run, dispatches to the provider runtime (`:146-158`) |
 | `chat.edit-send` | as above plus `anchorId` | Announces `history_truncated`, rewinds or resumes the provider transcript at the anchor, then dispatches (`:314-408`) |
 | `chat.abort` | `sessionId` | Aborts the runtime and emits the terminal `complete` on its behalf (`:415-438`) |
+| `chat.close` | `sessionId` | Ends the session's process for providers that keep one between turns (Claude); a run in flight is interrupted and completed here, like an abort |
 | `chat.subscribe` | `sessions: [{ sessionId, lastSeq }]` | Acks with `chat_subscribed`, attaches this socket to a running run, replays what was missed (`:448-504`) |
 | `chat.permission-response` | `requestId`, `allow`, `updatedInput?`, `message?`, `rememberEntry?` | Resolves one pending tool approval (`:511-522`) |
 
@@ -259,7 +260,7 @@ in `server/shared/types.ts`.**
 `history_truncated`, `task_notification`.
 
 **`GatewayEventKind` (`:204-208`) — produced by the gateway, no provider involved:**
-`chat_subscribed`, `session_upserted`, `loading_progress`, `protocol_error`.
+`chat_subscribed`, `session_upserted`, `session_process`, `loading_progress`, `protocol_error`.
 
 `ServerEventKind` (`:217`) is their union, and its doc comment claims every server-to-client
 frame carries a `kind` from it. That is true of everything the *chat gateway* sends and not
@@ -286,6 +287,7 @@ Two kinds in those unions never appear where you would look for them:
 | `chat_subscribed` | `chat-websocket.service.ts:485-492` | Authoritative processing state plus pending permissions (`:126-155`) |
 | `protocol_error` | `chat-websocket.service.ts:127` | Error row, spinner cleared |
 | `session_upserted` | `session-upsert-broadcast.service.ts:81-105` | `useProjectsState` — sidebar rows and alias folding |
+| `session_process` | `session-process-broadcast.service.ts` | A session's process started (`state: "chat"`) or ended (`state: "off"`); `chat_subscribed.process` carries the same snapshot for a late subscriber |
 | `loading_progress` | `projects-with-sessions-fetch.service.ts:164-175` | `useProjectsState` — project scan progress (`:720-736`) |
 
 ### The one exception

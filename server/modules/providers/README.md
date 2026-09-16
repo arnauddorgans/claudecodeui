@@ -377,4 +377,22 @@ alongside the implementation.
   user/project skill folders.
 - Assuming one provider's MCP config file format works for the others.
 
+## Claude: one process per session
 
+`list/claude/claude-runtime.provider.js` keeps one Claude CLI process per app session, across turns.
+Every turn used to spawn its own `claude --resume`, and since the background-work hold the next turn
+spawned a second process and closed the first one's stdin behind it, which does not stop a CLI still
+busy with that work: two processes resumed the same transcript and both appended to it.
+
+- The first turn of a session starts the process (with `--resume` when the session row has a
+  provider id); every following turn is pushed into its prompt stream. `run()` resolves at the
+  turn's `result`, not when the process ends.
+- `abort()` interrupts the turn and keeps the process. `close()` ends it: turn interrupted, stdin
+  closed, and the CLI killed after `CLAUDE_CLOSE_GRACE_MS` (10 s) if it has not left.
+- Model and permission mode change on the live process through the SDK's control channel. A turn
+  that edits a sent message (`resumeSessionAt`), or changes the working directory or the effort,
+  replaces the process in one step: the old one is closed before the new one starts.
+- `processes` exposes the live processes (`get`, `list`, `onChange`, `closeAll`); the websocket
+  gateway broadcasts every change as `session_process`, and the server closes them all on shutdown.
+- Callers with no app session (the agent and git routes, over SSE) get a process for one turn,
+  ended at its `result`.

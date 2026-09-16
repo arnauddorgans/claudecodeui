@@ -9,6 +9,7 @@ import type {
   ProviderRunFunction,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
+  SessionProcessSnapshot,
 } from '@/shared/types.js';
 
 type ProviderRuntimeServiceDependencies = {
@@ -89,6 +90,50 @@ export function createProviderRuntimeService(
 
     async abort(providerName: LLMProvider, sessionId: string): Promise<boolean> {
       return Boolean(await dependencies.resolveProvider(providerName).runtime.abort(sessionId));
+    },
+
+    /**
+     * Ends the session's process. False when the provider keeps none or none
+     * was alive for this session.
+     */
+    async close(providerName: LLMProvider, sessionId: string): Promise<boolean> {
+      const runtime = dependencies.resolveProvider(providerName).runtime;
+      return runtime.close ? Boolean(await runtime.close(sessionId)) : false;
+    },
+
+    getSessionProcess(sessionId: string): SessionProcessSnapshot | null {
+      for (const provider of dependencies.listProviders()) {
+        const snapshot = provider.runtime.processes?.get(sessionId);
+        if (snapshot) {
+          return snapshot;
+        }
+      }
+      return null;
+    },
+
+    listSessionProcesses(): SessionProcessSnapshot[] {
+      return dependencies.listProviders().flatMap(
+        (provider) => provider.runtime.processes?.list() ?? [],
+      );
+    },
+
+    /** Subscribes to every provider's process changes; returns the unsubscribe. */
+    onSessionProcessChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void {
+      const unsubscribes = dependencies.listProviders().map(
+        (provider) => provider.runtime.processes?.onChange(listener) ?? (() => {}),
+      );
+      return () => {
+        for (const unsubscribe of unsubscribes) {
+          unsubscribe();
+        }
+      };
+    },
+
+    /** Ends every process every provider keeps, for the server's shutdown. */
+    async closeAllSessionProcesses(): Promise<void> {
+      await Promise.all(
+        dependencies.listProviders().map((provider) => provider.runtime.processes?.closeAll()),
+      );
     },
 
     resolveToolApproval(requestId: string, decision: ProviderPermissionDecision): void {
