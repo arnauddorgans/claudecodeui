@@ -17,7 +17,7 @@ import {
   readProviderSkillMarkdownDefinition,
 } from '@/shared/utils.js';
 
-const getClaudeHomePath = (): string => path.join(os.homedir(), '.claude');
+const getClaudeHomePath = (): string => path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
 
 const getClaudePluginName = (pluginId: string): string | null => {
   const normalizedPluginId = pluginId.trim();

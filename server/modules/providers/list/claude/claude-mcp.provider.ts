@@ -25,7 +25,7 @@ export class ClaudeMcpProvider extends McpProvider {
       return readObjectRecord(config.mcpServers) ?? {};
     }
 
-    const filePath = path.join(os.homedir(), '.claude.json');
+    const filePath = path.join(process.env.CLAUDE_CONFIG_DIR || os.homedir(), '.claude.json');
     const config = await readJsonConfig(filePath);
     if (scope === 'user') {
       return readObjectRecord(config.mcpServers) ?? {};
@@ -49,7 +49,7 @@ export class ClaudeMcpProvider extends McpProvider {
       return;
     }
 
-    const filePath = path.join(os.homedir(), '.claude.json');
+    const filePath = path.join(process.env.CLAUDE_CONFIG_DIR || os.homedir(), '.claude.json');
     const config = await readJsonConfig(filePath);
     if (scope === 'user') {
       config.mcpServers = servers;

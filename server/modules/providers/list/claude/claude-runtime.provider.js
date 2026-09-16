@@ -683,7 +683,7 @@ function createInputStream() {
  */
 async function loadMcpConfig(cwd) {
   try {
-    const claudeConfigPath = path.join(os.homedir(), '.claude.json');
+    const claudeConfigPath = path.join(process.env.CLAUDE_CONFIG_DIR || os.homedir(), '.claude.json');
 
     // Check if config file exists
     try {

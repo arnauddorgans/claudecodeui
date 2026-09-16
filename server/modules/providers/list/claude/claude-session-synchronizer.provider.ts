@@ -23,7 +23,7 @@ type ParsedSession = {
  */
 export class ClaudeSessionSynchronizer implements IProviderSessionSynchronizer {
   private readonly provider = 'claude' as const;
-  private readonly claudeHome = path.join(os.homedir(), '.claude');
+  private readonly claudeHome = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
 
   /**
    * Returns true when a JSONL file is a subagent transcript or tool result

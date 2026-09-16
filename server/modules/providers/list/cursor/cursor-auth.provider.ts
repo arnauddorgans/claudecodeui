@@ -71,7 +71,7 @@ export class CursorProviderAuth implements IProviderAuth {
             error: 'Command timeout',
           });
         }
-      }, 5000);
+      }, 20000);
 
       try {
         childProcess = spawn('cursor-agent', ['status']);

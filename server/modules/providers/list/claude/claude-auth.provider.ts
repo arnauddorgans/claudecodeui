@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +17,33 @@ type ClaudeCredentialsStatus = {
   method: string | null;
   error?: string;
 };
+
+/**
+ * Reads `.credentials.json`, or on macOS the keychain item Claude Code keeps
+ * instead of the file: `Claude Code-credentials`, suffixed with the first 8
+ * hex chars of the SHA-256 of `CLAUDE_CONFIG_DIR` when that is set, as the
+ * CLI names it. Without this a keychain-only login reads as signed out.
+ */
+async function readClaudeCredentialsWithKeychain(credPath: string): Promise<string> {
+  try {
+    return await readFile(credPath, 'utf8');
+  } catch (fileError) {
+    if (process.platform !== 'darwin') {
+      throw fileError;
+    }
+    const dir = process.env.CLAUDE_CONFIG_DIR;
+    const service = 'Claude Code-credentials' + (dir ? '-' + createHash('sha256').update(dir).digest('hex').slice(0, 8) : '');
+    return await new Promise<string>((resolve, reject) => {
+      execFile('security', ['find-generic-password', '-s', service, '-w'], { timeout: 5000 }, (error, stdout) => {
+        if (error) {
+          reject(fileError);
+          return;
+        }
+        resolve(stdout.trim());
+      });
+    });
+  }
+}
 
 const hasErrorCode = (error: unknown, code: string): boolean => (
   error instanceof Error && 'code' in error && error.code === code
@@ -70,7 +99,7 @@ export class ClaudeProviderAuth implements IProviderAuth {
    */
   private async loadSettingsEnv(): Promise<Record<string, unknown>> {
     try {
-      const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+      const settingsPath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'settings.json');
       const content = await readFile(settingsPath, 'utf8');
       const settings = readObjectRecord(JSON.parse(content));
       return readObjectRecord(settings?.env) ?? {};
@@ -111,8 +140,8 @@ export class ClaudeProviderAuth implements IProviderAuth {
     }
 
     try {
-      const credPath = path.join(os.homedir(), '.claude', '.credentials.json');
-      const content = await readFile(credPath, 'utf8');
+      const credPath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), '.credentials.json');
+      const content = await readClaudeCredentialsWithKeychain(credPath);
       const creds = readObjectRecord(JSON.parse(content)) ?? {};
       const oauth = readObjectRecord(creds.claudeAiOauth);
       const accessToken = readOptionalString(oauth?.accessToken);

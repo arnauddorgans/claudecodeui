@@ -13,7 +13,7 @@ type WatcherEventType = 'add' | 'change';
 const PROVIDER_WATCH_PATHS: Array<{ provider: LLMProvider; rootPath: string }> = [
   {
     provider: 'claude',
-    rootPath: path.join(os.homedir(), '.claude', 'projects'),
+    rootPath: path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects'),
   },
   {
     provider: 'cursor',
