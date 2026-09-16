@@ -36,7 +36,7 @@ import {
   notifyRunStopped,
   notifyUserIfEnabled
 } from '@/modules/notifications/index.js';
-import { CLASSIC_BG_WAIT_CEILING_MS, resolveSessionProcessLifetime } from '@/shared/session-process-lifetime.js';
+import { AUTO_BG_WAIT_CEILING_MS, resolveSessionProcessClose } from '@/shared/session-process-close.js';
 import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.js';
 /**
  * One Claude CLI process per app session.
@@ -49,10 +49,10 @@ import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.j
  * session never has more than one process: a turn that cannot reuse the live
  * one closes it, and waits for it to be gone, before starting another.
  *
- * How long the process lives is `SESSION_PROCESS_LIFETIME`
- * (`shared/session-process-lifetime.ts`). `classic` keeps what CloudCLI always
+ * Who closes the process is `SESSION_PROCESS_CLOSE`
+ * (`shared/session-process-close.ts`). `auto` keeps what CloudCLI always
  * did: the process is let go at the turn's `result`, held only while
- * background work is outstanding, and replaced by the next turn. `forever`
+ * background work is outstanding, and replaced by the next turn. `manual`
  * takes every turn through the same process's prompt stream, and ends it only
  * when a client closes the session, when the server shuts down, or when a turn
  * needs options the CLI cannot take live (a rewind, a changed working
@@ -71,8 +71,8 @@ const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEO
 // closed — before it is killed.
 const CLOSE_GRACE_MS = parseInt(process.env.CLAUDE_CLOSE_GRACE_MS, 10) || 10000;
 // Passed to the CLI as CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: how long it waits for
-// its background agents once stdin closes. A `forever` process only gets there
-// on close; a `classic` one at the end of every turn, as before.
+// its background agents once stdin closes. A `manual` process only gets there
+// on close; an `auto` one at the end of every turn, as before.
 const BG_WAIT_ON_CLOSE_MS = 5000;
 // How long an abort waits for the interrupted turn's own `result` before handing
 // the session back; a `result` after that reads as background work reporting in.
@@ -247,7 +247,7 @@ function mapCliOptionsToSDK(options = {}) {
   sdkOptions.env = {
     ...process.env,
     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(
-      resolveSessionProcessLifetime() === 'forever' ? BG_WAIT_ON_CLOSE_MS : CLASSIC_BG_WAIT_CEILING_MS
+      resolveSessionProcessClose() === 'manual' ? BG_WAIT_ON_CLOSE_MS : AUTO_BG_WAIT_CEILING_MS
     )
   };
 
@@ -571,7 +571,7 @@ const DEFERRED_WORK_TOOLS = new Set(['Monitor', 'ScheduleWakeup', 'CronCreate', 
 /**
  * Detects tool calls that keep working after the turn's `result` arrives.
  *
- * In `classic` mode only turns that start background work hold their CLI
+ * Under `auto` only turns that start background work hold their CLI
  * process open; every other turn lets it exit at its `result`.
  *
  * @param {Object} sdkMessage - SDK stream message
@@ -737,7 +737,7 @@ async function loadMcpConfig(cwd) {
  * Runs one turn of a Claude session.
  *
  * A turn addressed to an app session goes to that session's process, started
- * here when there is none. In `classic` mode a process still alive from the
+ * here when there is none. Under `auto` a process still alive from the
  * previous turn (held for its background work) is closed first, as the next
  * turn always replaced it. Direct callers with no app session (the agent and
  * git routes, over SSE) get a process for this one turn, ended at its result.
@@ -755,8 +755,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // Callers pass the stable app session id; the SDK only understands the
   // provider-native id recorded on the session row.
   const providerSessionId = context.resolveProviderSessionId(sessionId);
-  const lifetime = resolveSessionProcessLifetime();
-  const persistent = Boolean(sessionId) && !ws?.isSSEStreamWriter && lifetime === 'forever';
+  const closing = resolveSessionProcessClose();
+  const persistent = Boolean(sessionId) && !ws?.isSSEStreamWriter && closing === 'manual';
 
   const promptMessages = await buildPromptMessages(command, options.images, options.files, options.cwd);
 
@@ -889,8 +889,8 @@ async function launchSessionProcess(spec) {
     turn: null,
     closing: false,
     exited: null,
-    // `classic` only: the timer that lets a process held for background work go
-    // after CLASSIC_BG_WAIT_CEILING_MS of silence.
+    // `auto` only: the timer that lets a process held for background work go
+    // after AUTO_BG_WAIT_CEILING_MS of silence.
     holdTimer: null,
   };
 
@@ -1207,7 +1207,7 @@ function handleProcessMessage(proc, message) {
     return;
   }
   if (backgroundWork) {
-    // `classic`: work started during this turn is still running. Hold the
+    // `auto`: work started during this turn is still running. Hold the
     // process open so it can finish and report back; the ceiling is only a
     // backstop for work that never reports.
     holdProcess(proc);
@@ -1220,7 +1220,7 @@ function handleProcessMessage(proc, message) {
 }
 
 /**
- * `classic` only: arms (or re-arms) the countdown after which a process held
+ * `auto` only: arms (or re-arms) the countdown after which a process held
  * for background work is let go.
  * @param {Object} proc - Session process
  */
@@ -1229,7 +1229,7 @@ function holdProcess(proc) {
   proc.holdTimer = setTimeout(() => {
     proc.holdTimer = null;
     proc.input.end();
-  }, CLASSIC_BG_WAIT_CEILING_MS);
+  }, AUTO_BG_WAIT_CEILING_MS);
   // Never let the hold keep the server process alive on its own.
   proc.holdTimer.unref?.();
 }

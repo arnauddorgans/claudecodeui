@@ -148,12 +148,12 @@ function installFakeSdk(script: (query: FakeQuery) => void = (query) => { query.
 }
 
 test.beforeEach(() => {
-  process.env.SESSION_PROCESS_LIFETIME = 'forever';
+  process.env.SESSION_PROCESS_CLOSE = 'manual';
 });
 
 test.afterEach(() => {
   setClaudeQueryImplementation(null);
-  delete process.env.SESSION_PROCESS_LIFETIME;
+  delete process.env.SESSION_PROCESS_CLOSE;
 });
 
 test('two turns of a session go through one process, which lives on until closed', async () => {
@@ -287,8 +287,8 @@ test('a process that dies under a turn reports the error and completes', async (
   assert.equal(getSessionProcess('app-6'), null);
 });
 
-test('classic: every turn gets its own process, the previous one gone first', async () => {
-  process.env.SESSION_PROCESS_LIFETIME = 'classic';
+test('auto: every turn gets its own process, the previous one gone first', async () => {
+  process.env.SESSION_PROCESS_CLOSE = 'auto';
   const queries = installFakeSdk();
   const writer = createWriter();
   const context = createContext();
@@ -296,15 +296,15 @@ test('classic: every turn gets its own process, the previous one gone first', as
   await queryClaudeSDK('hello', { sessionId: 'app-7' }, writer, context);
   await untilExited(queries[0]);
   assert.equal(queries[0].exited, true, 'let go at its result');
-  assert.equal(getSessionProcess('app-7'), null, 'classic processes are not announced');
+  assert.equal(getSessionProcess('app-7'), null, 'auto processes are not announced');
 
   await queryClaudeSDK('again', { sessionId: 'app-7' }, writer, context);
   assert.equal(queries.length, 2);
   assert.equal(queries[1].consumed.length, 1);
 });
 
-test('classic: a turn with background work holds its process, and the next turn replaces it', async () => {
-  process.env.SESSION_PROCESS_LIFETIME = 'classic';
+test('auto: a turn with background work holds its process, and the next turn replaces it', async () => {
+  process.env.SESSION_PROCESS_CLOSE = 'auto';
   const queries = installFakeSdk((query) => {
     query.onInput = () => {
       query.emit({ type: 'system', subtype: 'init', session_id: 'sid-8' });
