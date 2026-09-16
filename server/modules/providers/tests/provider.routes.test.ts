@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -240,5 +240,98 @@ test('model routes expose immutable defaults and full custom model CRUD', async 
       deletePayload.data.models.OPTIONS.some((option) => option.recordId === customRecordId),
       false,
     );
+  });
+});
+
+/**
+ * The transcript pair current Claude versions write for one subagent: the
+ * parent session next to `<session>/subagents/agent-<id>.jsonl` and its
+ * sidecar metadata.
+ */
+async function writeClaudeSessionWithAgent(workspacePath: string, sessionId: string, agentId: string): Promise<string> {
+  const parentPath = path.join(workspacePath, `${sessionId}.jsonl`);
+  const subagentDirectory = path.join(workspacePath, sessionId, 'subagents');
+  await mkdir(subagentDirectory, { recursive: true });
+  await writeFile(parentPath, `${JSON.stringify({
+    type: 'user', uuid: 'p-u1', sessionId, timestamp: '2026-09-01T10:00:00.000Z',
+    message: { role: 'user', content: [{ type: 'text', text: 'list the files' }] },
+  })}\n`, 'utf8');
+
+  const agentRows = [
+    {
+      type: 'user', uuid: 'a-u1', isSidechain: true, agentId, sessionId, timestamp: '2026-09-01T10:00:01.000Z',
+      message: { role: 'user', content: [{ type: 'text', text: 'List the files in this directory.' }] },
+    },
+    {
+      type: 'assistant', uuid: 'a-a1', isSidechain: true, agentId, sessionId, timestamp: '2026-09-01T10:00:02.000Z',
+      message: { role: 'assistant', model: 'claude-opus-5', content: [
+        { type: 'text', text: 'Looking.' },
+        { type: 'tool_use', id: 'toolu_ls', name: 'Bash', input: { command: 'ls' } },
+      ] },
+    },
+    {
+      type: 'user', uuid: 'a-u2', isSidechain: true, agentId, sessionId, timestamp: '2026-09-01T10:00:03.000Z',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_ls', content: 'a.txt\nb.txt' }] },
+    },
+    {
+      type: 'assistant', uuid: 'a-a2', isSidechain: true, agentId, sessionId, timestamp: '2026-09-01T10:00:04.000Z',
+      message: { role: 'assistant', model: 'claude-opus-5', content: [{ type: 'text', text: 'Two files.' }] },
+    },
+  ];
+  await writeFile(path.join(subagentDirectory, `agent-${agentId}.jsonl`), `${agentRows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
+  await writeFile(
+    path.join(subagentDirectory, `agent-${agentId}.meta.json`),
+    JSON.stringify({ agentType: 'Explore', description: 'List the files', toolUseId: 'toolu_agent', spawnDepth: 1 }),
+    'utf8',
+  );
+  return parentPath;
+}
+
+test('agent routes list a session subagents and page one transcript like the session messages', async () => {
+  await withProviderServer(async (baseUrl, workspacePath) => {
+    const sessionId = 'agents-session';
+    const agentId = 'a1b2c3d4e5f60718';
+    const parentPath = await writeClaudeSessionWithAgent(workspacePath, sessionId, agentId);
+    const now = new Date().toISOString();
+    sessionsDb.createSession(sessionId, 'claude', workspacePath, 'Agents session', now, now, parentPath);
+
+    const list = await fetch(`${baseUrl}/api/providers/sessions/${sessionId}/agents`);
+    assert.equal(list.status, 200);
+    const { data: { agents } } = await list.json() as { data: { agents: Array<Record<string, unknown>> } };
+    assert.equal(agents.length, 1);
+    assert.equal(agents[0].agentId, agentId);
+    assert.equal(agents[0].agentType, 'Explore');
+    assert.equal(agents[0].description, 'List the files');
+    assert.equal(agents[0].toolUseId, 'toolu_agent');
+    assert.equal(agents[0].messageCount, 4);
+    assert.equal(typeof agents[0].updatedAt, 'string');
+
+    const all = await fetch(`${baseUrl}/api/providers/sessions/${sessionId}/agents/${agentId}/messages`);
+    assert.equal(all.status, 200);
+    const full = (await all.json() as { data: { messages: Array<Record<string, unknown>>; total: number; hasMore: boolean; offset: number; limit: number | null } }).data;
+    assert.deepEqual(full.messages.map((message) => message.kind), ['text', 'text', 'tool_use', 'text']);
+    assert.equal(full.total, 4);
+    assert.equal(full.hasMore, false);
+    assert.deepEqual([full.offset, full.limit], [0, null]);
+    assert.ok(full.messages.every((message) => message.sessionId === sessionId), 'addressed by the app session id');
+    const toolUse = full.messages.find((message) => message.kind === 'tool_use') as { toolResult?: { content?: string } };
+    assert.equal(toolUse.toolResult?.content, 'a.txt\nb.txt', 'results are folded onto the call, as in /messages');
+
+    const page = await fetch(`${baseUrl}/api/providers/sessions/${sessionId}/agents/${agentId}/messages?limit=2&offset=1`);
+    const paged = (await page.json() as { data: { messages: Array<Record<string, unknown>>; total: number; hasMore: boolean } }).data;
+    assert.deepEqual(paged.messages.map((message) => message.kind), ['text', 'tool_use'], 'offset walks back from the newest');
+    assert.equal(paged.total, 4);
+    assert.equal(paged.hasMore, true);
+
+    const missing = await fetch(`${baseUrl}/api/providers/sessions/${sessionId}/agents/0000000000000000/messages`);
+    assert.equal(missing.status, 404);
+    assert.equal((await missing.json() as { error: { code: string } }).error.code, 'AGENT_NOT_FOUND');
+
+    const invalid = await fetch(`${baseUrl}/api/providers/sessions/${sessionId}/agents/..%2Fescape/messages`);
+    assert.equal(invalid.status, 400);
+    assert.equal((await invalid.json() as { error: { code: string } }).error.code, 'INVALID_AGENT_ID');
+
+    const unknownSession = await fetch(`${baseUrl}/api/providers/sessions/nope/agents`);
+    assert.equal(unknownSession.status, 404);
   });
 });

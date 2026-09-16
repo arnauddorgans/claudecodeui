@@ -11,6 +11,7 @@ import type {
   FetchHistoryResult,
   LLMProvider,
   NormalizedMessage,
+  SessionAgentSummary,
   SessionProcessSnapshot,
 } from '@/shared/types.js';
 import { AppError, sliceTailPage } from '@/shared/utils.js';
@@ -498,6 +499,66 @@ export const sessionsService = {
         ...message,
         sessionId,
       })),
+    };
+  },
+
+  /**
+   * The subagents a session spawned, from the transcripts its provider keeps
+   * for them. Empty for providers that keep none.
+   */
+  async listSessionAgents(sessionId: string): Promise<SessionAgentSummary[]> {
+    const session = sessionsDb.getSessionById(sessionId);
+    if (!session) {
+      throw new AppError(`Session "${sessionId}" was not found.`, {
+        code: 'SESSION_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+    if (!session.provider_session_id) {
+      return [];
+    }
+    const providerSessions = providerRegistry.resolveProvider(session.provider).sessions;
+    return providerSessions.listAgents?.(sessionId, {
+      projectPath: session.project_path ?? '',
+      providerSessionId: session.provider_session_id,
+    }) ?? [];
+  },
+
+  /**
+   * One subagent's transcript, paged like `fetchHistory`. 404 for a session
+   * or agent that does not exist, and for providers that keep no subagent
+   * transcripts, which have no agent to find.
+   */
+  async fetchAgentHistory(
+    sessionId: string,
+    agentId: string,
+    options: Pick<FetchHistoryOptions, 'limit' | 'offset'> = {},
+  ): Promise<FetchHistoryResult> {
+    const session = sessionsDb.getSessionById(sessionId);
+    if (!session) {
+      throw new AppError(`Session "${sessionId}" was not found.`, {
+        code: 'SESSION_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+    const providerSessions = providerRegistry.resolveProvider(session.provider).sessions;
+    const result = session.provider_session_id
+      ? await providerSessions.fetchAgentHistory?.(sessionId, agentId, {
+        limit: options.limit ?? null,
+        offset: options.offset ?? 0,
+        projectPath: session.project_path ?? '',
+        providerSessionId: session.provider_session_id,
+      })
+      : null;
+    if (!result) {
+      throw new AppError(`Session "${sessionId}" has no agent "${agentId}".`, {
+        code: 'AGENT_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+    return {
+      ...result,
+      messages: result.messages.map((message) => ({ ...message, sessionId })),
     };
   },
 

@@ -9,6 +9,7 @@ import type {
   FetchHistoryOptions,
   FetchHistoryResult,
   NormalizedMessage,
+  SessionAgentSummary,
   SessionTaskStatus,
   SessionTaskUsage,
   SubagentActivity,
@@ -19,6 +20,7 @@ import { prepareTranscriptMessages } from '@/shared/message-unification.js';
 import {
   createNormalizedMessage,
   generateMessageId,
+  readFileTimestamps,
   readObjectRecord,
   sliceTailPage,
   truncateSubagentActivity,
@@ -171,6 +173,7 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
 type ClaudeSubagentMeta = {
   agentType?: string;
   description?: string;
+  toolUseId?: string;
 };
 
 /** Reads the sidecar `.meta.json` Claude writes next to a subagent transcript. */
@@ -180,10 +183,71 @@ async function readClaudeSubagentMeta(metaPath: string): Promise<ClaudeSubagentM
     return {
       agentType: typeof parsed.agentType === 'string' ? parsed.agentType : undefined,
       description: typeof parsed.description === 'string' ? parsed.description : undefined,
+      toolUseId: typeof parsed.toolUseId === 'string' ? parsed.toolUseId : undefined,
     };
   } catch {
     return {};
   }
+}
+
+/** Agent ids are hex today; the pattern only has to keep a path segment honest. */
+const CLAUDE_AGENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+export function isValidClaudeAgentId(agentId: string): boolean {
+  return CLAUDE_AGENT_ID_PATTERN.test(agentId);
+}
+
+/**
+ * Lists the subagents of a session from `<session>/subagents/`, the layout
+ * current Claude versions write. Older versions dropped agent transcripts next
+ * to the parent's with nothing tying them to a session, so those are not
+ * listed (their transcript still resolves by id, see
+ * `findClaudeSubagentTranscript`).
+ */
+async function listClaudeSubagents(projectDirectory: string, providerSessionId: string): Promise<SessionAgentSummary[]> {
+  const directory = path.join(projectDirectory, providerSessionId, 'subagents');
+  let names: string[];
+  try {
+    names = await fsp.readdir(directory);
+  } catch {
+    return [];
+  }
+
+  const agents: SessionAgentSummary[] = [];
+  for (const name of names.sort()) {
+    const match = /^agent-([A-Za-z0-9_-]+)\.jsonl$/.exec(name);
+    if (!match) {
+      continue;
+    }
+    const transcriptPath = path.join(directory, name);
+    const [meta, timestamps, messageCount] = await Promise.all([
+      readClaudeSubagentMeta(transcriptPath.replace(/\.jsonl$/, '.meta.json')),
+      readFileTimestamps(transcriptPath),
+      countTranscriptTurns(transcriptPath),
+    ]);
+    agents.push({
+      agentId: match[1],
+      agentType: meta.agentType,
+      description: meta.description,
+      toolUseId: meta.toolUseId,
+      createdAt: timestamps.createdAt,
+      updatedAt: timestamps.updatedAt,
+      messageCount,
+    });
+  }
+
+  return agents;
+}
+
+/** Counts a transcript's user and assistant rows, without normalizing them. */
+async function countTranscriptTurns(jsonlPath: string): Promise<number> {
+  let count = 0;
+  for (const row of await readTranscriptRows(jsonlPath, null)) {
+    if (row.type === 'user' || row.type === 'assistant') {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 /**
@@ -312,9 +376,11 @@ function replaceAgentToolResultContent(message: AnyRecord, replacement: string):
  *
  * The file is append-only and every row names its predecessor in `parentUuid`,
  * so a conversation is a path through it rather than the whole file. Editing a
- * sent message makes a second path appear alongside the first.
+ * sent message makes a second path appear alongside the first. A
+ * `providerSessionId` keeps only that session's rows; `null` keeps every row,
+ * for a subagent's file, which holds one agent whatever id its rows carry.
  */
-async function readTranscriptRows(jsonlPath: string, providerSessionId: string): Promise<AnyRecord[]> {
+async function readTranscriptRows(jsonlPath: string, providerSessionId: string | null): Promise<AnyRecord[]> {
   const rows: AnyRecord[] = [];
   const fileStream = fs.createReadStream(jsonlPath);
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
@@ -325,7 +391,7 @@ async function readTranscriptRows(jsonlPath: string, providerSessionId: string):
     }
     try {
       const entry = JSON.parse(line) as AnyRecord;
-      if (entry.sessionId === providerSessionId) {
+      if (providerSessionId === null || entry.sessionId === providerSessionId) {
         rows.push(entry);
       }
     } catch {
@@ -1150,7 +1216,60 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     }
 
     const rawMessages = Array.isArray(result) ? result : (result.messages || []);
+    return this.normalizeTranscriptPage(rawMessages, sessionId, limit, offset);
+  }
 
+  /**
+   * The subagents a session spawned, listed from their transcripts on disk.
+   */
+  async listAgents(sessionId: string, options: FetchHistoryOptions = {}): Promise<SessionAgentSummary[]> {
+    const jsonlPath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
+    const providerSessionId = options.providerSessionId ?? sessionId;
+    if (!jsonlPath) {
+      return [];
+    }
+    return listClaudeSubagents(path.dirname(jsonlPath), providerSessionId);
+  }
+
+  /**
+   * One subagent's transcript, read like the session's own: the same
+   * normalizer, the same page slicing, the same envelope. `null` when the
+   * session has no transcript for that agent.
+   */
+  async fetchAgentHistory(
+    sessionId: string,
+    agentId: string,
+    options: FetchHistoryOptions = {},
+  ): Promise<FetchHistoryResult | null> {
+    const { limit = null, offset = 0 } = options;
+    const providerSessionId = options.providerSessionId ?? sessionId;
+    const jsonlPath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
+    if (!jsonlPath || !isValidClaudeAgentId(agentId)) {
+      return null;
+    }
+
+    const located = await findClaudeSubagentTranscript(path.dirname(jsonlPath), providerSessionId, agentId);
+    if (!located) {
+      return null;
+    }
+
+    const rows = (await readTranscriptRows(located.transcriptPath, null))
+      .sort((a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime());
+    return this.normalizeTranscriptPage(rows, sessionId, limit, offset);
+  }
+
+  /**
+   * Normalizes transcript rows and slices the requested page: tool results
+   * are folded onto their `tool_use`, then only what the transcript draws is
+   * kept, so a page of N rows is N rows the user sees and `total` counts the
+   * same thing.
+   */
+  private normalizeTranscriptPage(
+    rawMessages: AnyRecord[],
+    sessionId: string,
+    limit: number | null,
+    offset: number,
+  ): FetchHistoryResult {
     const toolResultMap = new Map<string, ClaudeToolResult>();
     for (const raw of rawMessages) {
       if (raw.message?.role === 'user' && Array.isArray(raw.message?.content)) {
@@ -1192,8 +1311,6 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       }
     }
 
-    // Everything the transcript draws, and nothing else — so a page of N rows
-    // is N rows the user sees, and `total` counts the same thing.
     const transcript = prepareTranscriptMessages(normalized);
     const total = transcript.length;
     const normalizedOffset = Math.max(0, offset);

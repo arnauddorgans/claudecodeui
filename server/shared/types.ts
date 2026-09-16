@@ -561,6 +561,22 @@ export type FetchHistoryOptions = {
 };
 
 /**
+ * One subagent a session spawned, as listed from its transcript on disk.
+ */
+export type SessionAgentSummary = {
+  agentId: string;
+  /** Agent type and task line, when the provider's sidecar metadata has them. */
+  agentType?: string;
+  description?: string;
+  /** The tool call that spawned the agent, when the metadata names it. */
+  toolUseId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  /** Transcript rows the agent recorded (user and assistant turns), not normalized messages. */
+  messageCount: number;
+};
+
+/**
  * Standardized response payload returned from provider history readers.
  *
  * Use this as the contract for APIs that return paginated conversation history.

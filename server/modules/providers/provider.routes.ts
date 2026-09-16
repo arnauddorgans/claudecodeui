@@ -53,6 +53,21 @@ const parseSessionId = (value: unknown): string => {
   return sessionId;
 };
 
+// A path segment under the session's transcript directory: nothing but the id.
+const AGENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+const parseAgentId = (value: unknown): string => {
+  const agentId = readPathParam(value, 'agentId').trim();
+  if (!AGENT_ID_PATTERN.test(agentId)) {
+    throw new AppError('Invalid agentId.', {
+      code: 'INVALID_AGENT_ID',
+      statusCode: 400,
+    });
+  }
+
+  return agentId;
+};
+
 const readOptionalQueryString = (value: unknown): string | undefined => {
   if (typeof value !== 'string') {
     return undefined;
@@ -842,6 +857,32 @@ router.get(
     const offset = parseBoundedIntegerQuery(req.query.offset, 'offset', 0, 0);
 
     const result = await sessionsService.fetchHistory(sessionId, {
+      limit,
+      offset,
+    });
+    res.json(createApiSuccessResponse(result));
+  }),
+);
+
+router.get(
+  '/sessions/:sessionId/agents',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const agents = await sessionsService.listSessionAgents(sessionId);
+    res.json(createApiSuccessResponse({ agents }));
+  }),
+);
+
+// A subagent's transcript, paged like the session's `/messages`.
+router.get(
+  '/sessions/:sessionId/agents/:agentId/messages',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const agentId = parseAgentId(req.params.agentId);
+    const limit = parseBoundedIntegerQuery(req.query.limit, 'limit', null, 0);
+    const offset = parseBoundedIntegerQuery(req.query.offset, 'offset', 0, 0);
+
+    const result = await sessionsService.fetchAgentHistory(sessionId, agentId, {
       limit,
       offset,
     });

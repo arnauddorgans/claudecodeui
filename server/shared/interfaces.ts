@@ -2,6 +2,7 @@ import type {
   AnyRecord,
   FetchHistoryOptions,
   FetchHistoryResult,
+  SessionAgentSummary,
   LLMProvider,
   McpScope,
   NormalizedMessage,
@@ -198,6 +199,22 @@ export interface IProviderMcp {
 export interface IProviderSessions {
   normalizeMessage(raw: unknown, sessionId: string | null): NormalizedMessage[];
   fetchHistory(sessionId: string, options?: FetchHistoryOptions): Promise<FetchHistoryResult>;
+
+  /**
+   * The subagents a session spawned, from the transcripts the provider keeps
+   * for them. Only providers that store subagent transcripts implement it.
+   */
+  listAgents?(sessionId: string, options: FetchHistoryOptions): Promise<SessionAgentSummary[]>;
+
+  /**
+   * One subagent's transcript, normalized and paged exactly like
+   * `fetchHistory`. Resolves `null` when the session has no such agent.
+   */
+  fetchAgentHistory?(
+    sessionId: string,
+    agentId: string,
+    options: FetchHistoryOptions,
+  ): Promise<FetchHistoryResult | null>;
 
   /**
    * Resolves where a conversation must resume from so that the turn identified
