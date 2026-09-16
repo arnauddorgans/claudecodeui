@@ -28,6 +28,8 @@ function snapshotOf(entry: TerminalEntry, state: 'terminal' | 'off'): SessionPro
     since: entry.since,
     providerSessionId: null,
     turnActive: false,
+    // The interactive CLI has no control channel, so a terminal's tasks are unknown.
+    tasks: [],
   };
 }
 

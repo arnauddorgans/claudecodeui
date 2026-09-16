@@ -41,6 +41,12 @@ export interface IProviderRuntime {
    * turns implement it; for the others a session has nothing to close.
    */
   close?(sessionId: string): boolean | Promise<boolean>;
+  /**
+   * Stops one task of the session's process (a subagent, a backgrounded
+   * shell). False when the session has no process or the task is unknown to
+   * it. Only providers whose process reports its tasks implement it.
+   */
+  stopTask?(sessionId: string, taskId: string): boolean | Promise<boolean>;
   /** The processes the provider keeps alive between turns, when it does. */
   processes?: ProviderRuntimeProcessGateway;
   permissions?: ProviderRuntimePermissionGateway;

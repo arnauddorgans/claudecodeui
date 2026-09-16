@@ -59,6 +59,7 @@ import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.j
  * directory), in which case it is replaced in one step.
  */
 /** @typedef {import('@/shared/types.js').SessionProcessSnapshot} SessionProcessSnapshot */
+/** @typedef {import('@/shared/types.js').SessionProcessTask} SessionProcessTask */
 
 const sessionProcesses = new Map();
 const pendingToolApprovals = new Map();
@@ -345,8 +346,72 @@ function describeProcess(proc, state = 'chat') {
     state,
     since: proc.startedAt,
     providerSessionId: proc.providerSessionId,
-    turnActive: Boolean(proc.turn)
+    turnActive: Boolean(proc.turn),
+    tasks: Array.from(proc.tasks.values())
   };
+}
+
+const ENDED_TASK_STATUSES = new Set(['completed', 'failed', 'stopped']);
+
+/**
+ * Keeps the process's record of a task up to date from one of the SDK's task
+ * events, already normalized into a `task` message. The record outlives the
+ * task so a client subscribing later still sees what ran, and it is what fills
+ * the gaps in a `task_updated` frame, which only names what changed.
+ * @param {Object} proc - Session process
+ * @param {Object} msg - Normalized `task` message
+ * @returns {{ task: SessionProcessTask, changed: boolean }} The record, and whether the task started or ended
+ */
+function recordTask(proc, msg) {
+  let task = proc.tasks.get(msg.taskId);
+  const isNew = !task;
+  if (!task) {
+    task = {
+      taskId: msg.taskId,
+      description: msg.description || '',
+      background: false,
+      status: 'started',
+      startedAt: Date.now(),
+    };
+    proc.tasks.set(task.taskId, task);
+  }
+
+  const wasEnded = ENDED_TASK_STATUSES.has(task.status);
+  for (const key of ['toolUseId', 'description', 'taskType', 'agentType', 'summary', 'usage']) {
+    if (msg[key] !== undefined) {
+      task[key] = msg[key];
+    }
+  }
+  if (typeof msg.background === 'boolean') {
+    task.background = msg.background;
+  }
+  // An ended task does not come back: a late progress frame is not a restart.
+  if (msg.status && !(wasEnded && !ENDED_TASK_STATUSES.has(msg.status))) {
+    task.status = msg.status;
+  }
+  const ended = !wasEnded && ENDED_TASK_STATUSES.has(task.status);
+  if (ended) {
+    task.endedAt = Date.now();
+  }
+
+  return { task, changed: isNew || ended };
+}
+
+/**
+ * Stops one task of a session's process through the SDK's control channel.
+ * The CLI answers with a `task_notification` of status `stopped`, which ends
+ * the task's record like any other.
+ * @param {string} sessionId - App session id
+ * @param {string} taskId - Task id, as reported on the `task` frames
+ * @returns {Promise<boolean>} False when the session has no live process or the task is not one of its
+ */
+async function stopClaudeSDKTask(sessionId, taskId) {
+  const proc = sessionProcesses.get(sessionId);
+  if (!proc || proc.closing || !proc.tasks.has(taskId)) {
+    return false;
+  }
+  await proc.query.stopTask(taskId);
+  return true;
 }
 
 function emitProcessChange(proc, state) {
@@ -886,6 +951,8 @@ async function launchSessionProcess(spec) {
     sessionSummary: spec.sessionSummary,
     context: spec.context,
     startedAt: Date.now(),
+    // Every task the process ran, by task id (see `recordTask`).
+    tasks: new Map(),
     turn: null,
     closing: false,
     exited: null,
@@ -1149,20 +1216,31 @@ function handleProcessMessage(proc, message) {
   const writer = proc.writer;
   const sid = eventSessionIdOf(proc);
 
-  if (writer) {
-    // Transform and normalize message via adapter
-    const transformedMessage = transformMessage(message);
-    const normalized = proc.context.normalizeMessage(transformedMessage, sid);
-    for (const msg of normalized) {
-      // Preserve parentToolUseId from SDK wrapper for subagent tool grouping
-      if (transformedMessage.parentToolUseId && !msg.parentToolUseId) {
-        msg.parentToolUseId = transformedMessage.parentToolUseId;
-      }
-      if (isSubagentPromptEcho(msg)) {
-        continue;
-      }
-      writer.send(msg);
+  // Transform and normalize message via adapter
+  const transformedMessage = transformMessage(message);
+  const normalized = proc.context.normalizeMessage(transformedMessage, sid);
+  let tasksChanged = false;
+  for (const msg of normalized) {
+    // Preserve parentToolUseId from SDK wrapper for subagent tool grouping
+    if (transformedMessage.parentToolUseId && !msg.parentToolUseId) {
+      msg.parentToolUseId = transformedMessage.parentToolUseId;
     }
+    if (isSubagentPromptEcho(msg)) {
+      continue;
+    }
+    if (msg.kind === 'task') {
+      // The frame goes out whole: what this event left unsaid, the record knows.
+      const { task, changed } = recordTask(proc, msg);
+      Object.assign(msg, task);
+      tasksChanged = tasksChanged || changed;
+    }
+    writer?.send(msg);
+  }
+  if (tasksChanged) {
+    emitProcessChange(proc, 'chat');
+  }
+
+  if (writer) {
 
     // Extract and send token budget updates from assistant usage payloads,
     // falling back to the turn's cumulative bill only for SDK builds that
@@ -1474,6 +1552,7 @@ export const claudeRuntime = {
   run: queryClaudeSDK,
   abort: abortClaudeSDKSession,
   close: closeClaudeSDKSession,
+  stopTask: stopClaudeSDKTask,
   processes: {
     get: getSessionProcess,
     list: listSessionProcesses,
@@ -1492,6 +1571,7 @@ export {
   abortClaudeSDKSession,
   closeClaudeSDKSession,
   closeAllClaudeSDKSessions,
+  stopClaudeSDKTask,
   getSessionProcess,
   listSessionProcesses,
   onSessionProcessChange,

@@ -190,7 +190,8 @@ export type MessageKind =
   | 'permission_cancelled'
   | 'session_created'
   | 'history_truncated'
-  | 'task_notification';
+  | 'task_notification'
+  | 'task';
 
 /**
  * Event kinds added by the chat gateway layer on top of provider message kinds.
@@ -253,10 +254,47 @@ export type SessionUpsertedEvent = {
   timestamp: string;
 };
 
+/** Where a task stands. `started` until the provider reports it running. */
+export type SessionTaskStatus = 'started' | 'running' | 'completed' | 'failed' | 'stopped';
+
+/** What a task has consumed so far, as the provider reports it. */
+export type SessionTaskUsage = {
+  totalTokens: number;
+  toolUses: number;
+  durationMs: number;
+};
+
+/**
+ * One task a session's process runs: a subagent, a backgrounded shell, a
+ * monitor. The same fields ride on the `task` message kind; here they are
+ * the process's own record, kept until the process ends so a client
+ * subscribing later still sees what ran.
+ */
+export type SessionProcessTask = {
+  taskId: string;
+  /** The tool call that started it, when the provider reports one. */
+  toolUseId?: string;
+  description: string;
+  /** Provider label for the task's kind (`subagent`, `shell`, ...). */
+  taskType?: string;
+  /** Subagent type, for subagent tasks. */
+  agentType?: string;
+  /** True once the task runs past the turn that started it. */
+  background: boolean;
+  status: SessionTaskStatus;
+  /** Epoch milliseconds. */
+  startedAt: number;
+  endedAt?: number;
+  /** The provider's closing note, once the task ended. */
+  summary?: string;
+  usage?: SessionTaskUsage;
+};
+
 /**
  * A session's process: `chat` while its provider keeps one alive between
  * turns, `terminal` while a `/shell` PTY has the provider's CLI resumed on it,
- * `off` once it has gone. `turnActive` says whether a chat turn is in flight.
+ * `off` once it has gone. `turnActive` says whether a chat turn is in flight;
+ * `tasks` are the tasks the process has run, ended ones included.
  */
 export type SessionProcessSnapshot = {
   sessionId: string;
@@ -266,6 +304,7 @@ export type SessionProcessSnapshot = {
   since: number;
   providerSessionId: string | null;
   turnActive: boolean;
+  tasks: SessionProcessTask[];
 };
 
 /**
@@ -344,6 +383,20 @@ export type NormalizedMessage = {
   status?: string;
   summary?: string;
   tokenBudget?: unknown;
+  /**
+   * `task` messages: a task of the session's process starting, progressing or
+   * ending. `status` and `summary` above are the task's; `background` is set
+   * once the task runs past its turn.
+   */
+  taskId?: string;
+  toolUseId?: string;
+  description?: string;
+  taskType?: string;
+  agentType?: string;
+  background?: boolean;
+  usage?: SessionTaskUsage;
+  /** Set on everything a subagent emits: the tool call that spawned it. */
+  parentToolUseId?: string;
   /**
    * Timeline of everything a subagent did, attached to the `tool_use` that
    * spawned it. Present for Claude `Agent`/`Task` calls and Codex

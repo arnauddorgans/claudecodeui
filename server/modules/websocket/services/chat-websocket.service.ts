@@ -79,6 +79,8 @@ export type ProviderRuntimeGateway = {
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
   /** Ends the session's process, for providers that keep one between turns. */
   close(provider: LLMProvider, sessionId: string): Promise<boolean>;
+  /** Stops one task of the session's process; false when there is none to stop. */
+  stopTask(provider: LLMProvider, sessionId: string, taskId: string): Promise<boolean>;
   getSessionProcess(sessionId: string): SessionProcessSnapshot | null;
   onSessionProcessChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
@@ -497,6 +499,62 @@ async function handleChatClose(
 }
 
 /**
+ * Handles `chat.stop-task`: stops one task of the session's process (a
+ * subagent, a backgrounded shell) and leaves the process and its turn alone.
+ * The task's end reaches every client as a `task` frame and a
+ * `session_process` broadcast, the way any task ending does.
+ */
+async function handleChatStopTask(
+  ws: WebSocket,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies
+): Promise<void> {
+  const sessionId = readRequiredSessionId(data);
+  if (!sessionId) {
+    sendProtocolError(ws, 'SESSION_ID_REQUIRED', 'chat.stop-task requires a sessionId.');
+    return;
+  }
+  const taskId = typeof data.taskId === 'string' ? data.taskId.trim() : '';
+  if (!taskId) {
+    sendProtocolError(ws, 'TASK_ID_REQUIRED', 'chat.stop-task requires a taskId.', sessionId);
+    return;
+  }
+
+  const session = sessionsDb.getSessionById(sessionId);
+  if (!session) {
+    sendProtocolError(ws, 'SESSION_NOT_FOUND', `Session "${sessionId}" was not found.`, sessionId);
+    return;
+  }
+
+  const provider = session.provider as LLMProvider;
+  if (!dependencies.runtime.hasRuntime(provider)) {
+    sendProtocolError(ws, 'UNSUPPORTED_PROVIDER', `Provider "${provider}" is not available.`, sessionId);
+    return;
+  }
+
+  // Only a chat process reports its tasks; a session in a terminal has none to name.
+  const process = sessionProcessRegistry.get(sessionId, dependencies.runtime.getSessionProcess);
+  if (!process || process.state !== 'chat') {
+    sendProtocolError(ws, 'NO_PROCESS', `Session "${sessionId}" has no process in the chat.`, sessionId);
+    return;
+  }
+  const task = process.tasks.find((candidate) => candidate.taskId === taskId);
+  if (!task) {
+    sendProtocolError(ws, 'TASK_NOT_FOUND', `Session "${sessionId}" has no task "${taskId}".`, sessionId);
+    return;
+  }
+  if (task.endedAt !== undefined) {
+    sendProtocolError(ws, 'TASK_ENDED', `Task "${taskId}" has already ended (${task.status}).`, sessionId);
+    return;
+  }
+
+  const stopped = await dependencies.runtime.stopTask(provider, sessionId, taskId);
+  if (!stopped) {
+    sendProtocolError(ws, 'STOP_TASK_FAILED', `Task "${taskId}" could not be stopped.`, sessionId);
+  }
+}
+
+/**
  * Handles `chat.subscribe`: for each requested session, reports whether a run
  * is processing, re-attaches the live stream to this socket, replays missed
  * events (seq > lastSeq), and includes pending permission requests and the
@@ -589,6 +647,7 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  * - `chat.send`                { sessionId, content, options? }
  * - `chat.abort`               { sessionId }
  * - `chat.close`               { sessionId }
+ * - `chat.stop-task`           { sessionId, taskId }
  * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
  * - `chat.permission-response` { requestId, allow, updatedInput?, message?, rememberEntry? }
  *
@@ -694,6 +753,9 @@ export function handleChatConnection(
           return;
         case 'chat.close':
           await handleChatClose(ws, data, dependencies);
+          return;
+        case 'chat.stop-task':
+          await handleChatStopTask(ws, data, dependencies);
           return;
         case 'chat.subscribe':
           handleChatSubscribe(ws, data, dependencies);

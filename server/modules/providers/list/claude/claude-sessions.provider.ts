@@ -9,6 +9,8 @@ import type {
   FetchHistoryOptions,
   FetchHistoryResult,
   NormalizedMessage,
+  SessionTaskStatus,
+  SessionTaskUsage,
   SubagentActivity,
   SubagentInfo,
 } from '@/shared/types.js';
@@ -642,6 +644,107 @@ function buildLocalCommandDisplayText(payload: ClaudeLocalCommandPayload): strin
  * Claude local-command stdout may contain ANSI styling codes because it was
  * captured from the terminal. The web chat should receive readable plain text.
  */
+const CLAUDE_TASK_SUBTYPES = new Set(['task_started', 'task_updated', 'task_progress', 'task_notification']);
+
+/**
+ * Task status as the SDK's `task_updated` patch names it, in the shared
+ * vocabulary. `paused` stays `running`: the task is still the process's.
+ */
+const CLAUDE_TASK_PATCH_STATUS: Record<string, SessionTaskStatus> = {
+  pending: 'started',
+  running: 'running',
+  completed: 'completed',
+  failed: 'failed',
+  killed: 'stopped',
+  paused: 'running',
+};
+
+function readTaskUsage(value: unknown): SessionTaskUsage | undefined {
+  const usage = readObjectRecord(value);
+  if (!usage) {
+    return undefined;
+  }
+  return {
+    totalTokens: Number(usage.total_tokens) || 0,
+    toolUses: Number(usage.tool_uses) || 0,
+    durationMs: Number(usage.duration_ms) || 0,
+  };
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/**
+ * One `task` message from an SDK task event (`task_started`, `task_updated`,
+ * `task_progress`, `task_notification`).
+ *
+ * Only what the event carries is set: a `task_updated` names the task and the
+ * fields that changed, nothing more. The runtime fills the rest in from the
+ * process's own record before the message reaches a client, so a stateless
+ * reader of this stream can still rely on `taskId` and `status`.
+ */
+export function normalizeClaudeTaskMessage(raw: AnyRecord, sessionId: string | null): NormalizedMessage | null {
+  const subtype = raw.subtype;
+  if (raw.type !== 'system' || typeof subtype !== 'string' || !CLAUDE_TASK_SUBTYPES.has(subtype)) {
+    return null;
+  }
+  const taskId = readOptionalString(raw.task_id);
+  if (!taskId) {
+    return null;
+  }
+
+  const fields: Partial<NormalizedMessage> = {
+    taskId,
+    toolUseId: readOptionalString(raw.tool_use_id),
+    description: readOptionalString(raw.description),
+    agentType: readOptionalString(raw.subagent_type),
+  };
+
+  switch (subtype) {
+    case 'task_started':
+      fields.status = 'started';
+      fields.taskType = readOptionalString(raw.task_type);
+      fields.background = false;
+      break;
+    case 'task_updated': {
+      const patch = readObjectRecord(raw.patch) ?? {};
+      fields.status = typeof patch.status === 'string' ? CLAUDE_TASK_PATCH_STATUS[patch.status] : undefined;
+      fields.description = readOptionalString(patch.description);
+      fields.background = typeof patch.is_backgrounded === 'boolean' ? patch.is_backgrounded : undefined;
+      fields.summary = readOptionalString(patch.error);
+      break;
+    }
+    case 'task_progress':
+      fields.status = 'running';
+      fields.usage = readTaskUsage(raw.usage);
+      fields.summary = readOptionalString(raw.summary);
+      break;
+    case 'task_notification':
+      fields.status = raw.status === 'failed' || raw.status === 'stopped' ? raw.status : 'completed';
+      fields.usage = readTaskUsage(raw.usage);
+      fields.summary = readOptionalString(raw.summary);
+      break;
+    default:
+      return null;
+  }
+
+  for (const key of Object.keys(fields) as Array<keyof typeof fields>) {
+    if (fields[key] === undefined) {
+      delete fields[key];
+    }
+  }
+
+  return createNormalizedMessage({
+    ...fields,
+    id: readOptionalString(raw.uuid),
+    kind: 'task',
+    sessionId,
+    provider: PROVIDER,
+    parentToolUseId: readOptionalString(raw.parent_tool_use_id),
+  });
+}
+
 function stripAnsiFormatting(text: string): string {
   return text.replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, '');
 }
@@ -685,6 +788,10 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     }
     if (raw.type === 'content_block_stop') {
       return [createNormalizedMessage({ kind: 'stream_end', sessionId, provider: PROVIDER })];
+    }
+    if (raw.type === 'system') {
+      const task = normalizeClaudeTaskMessage(raw, sessionId);
+      return task ? [task] : [];
     }
 
     const messages: NormalizedMessage[] = [];

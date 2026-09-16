@@ -103,6 +103,7 @@ const liveProcess: SessionProcessSnapshot = {
   since: 1,
   providerSessionId: 'sid',
   turnActive: false,
+  tasks: [],
 };
 
 test('chat.close ends the process of an idle session and sends no complete', async () => {

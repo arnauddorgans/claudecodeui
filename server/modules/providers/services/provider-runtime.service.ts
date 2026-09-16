@@ -101,6 +101,16 @@ export function createProviderRuntimeService(
       return runtime.close ? Boolean(await runtime.close(sessionId)) : false;
     },
 
+    /**
+     * Stops one task of the session's process. False when the provider does
+     * not report tasks, the session has no process, or the task is not one of
+     * its.
+     */
+    async stopTask(providerName: LLMProvider, sessionId: string, taskId: string): Promise<boolean> {
+      const runtime = dependencies.resolveProvider(providerName).runtime;
+      return runtime.stopTask ? Boolean(await runtime.stopTask(sessionId, taskId)) : false;
+    },
+
     getSessionProcess(sessionId: string): SessionProcessSnapshot | null {
       for (const provider of dependencies.listProviders()) {
         const snapshot = provider.runtime.processes?.get(sessionId);

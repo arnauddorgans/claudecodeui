@@ -8,8 +8,10 @@ import {
   onSessionProcessChange,
   queryClaudeSDK,
   setClaudeQueryImplementation,
+  stopClaudeSDKTask,
 } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude-models.provider.js';
+import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
 import type { AnyRecord, ProviderRuntimeContext, SessionProcessSnapshot } from '@/shared/types.js';
 
 /** A pushable async iterable, the shape of the SDK's own output stream. */
@@ -43,6 +45,7 @@ function createChannel<T>() {
 class FakeQuery {
   consumed: AnyRecord[] = [];
   interrupts = 0;
+  stoppedTasks: string[] = [];
   models: string[] = [];
   modes: string[] = [];
   flagSettings: AnyRecord[] = [];
@@ -81,6 +84,7 @@ class FakeQuery {
   }
 
   async interrupt(): Promise<void> { this.interrupts += 1; }
+  async stopTask(taskId: string): Promise<void> { this.stoppedTasks.push(taskId); }
   async setModel(model: string): Promise<void> { this.models.push(model); }
   async setPermissionMode(mode: string): Promise<void> { this.modes.push(mode); }
   async applyFlagSettings(settings: AnyRecord): Promise<void> { this.flagSettings.push(settings); }
@@ -328,4 +332,68 @@ test('auto: a turn with background work holds its process, and the next turn rep
   assert.equal(queries.length, 2, 'the next turn gets a new process');
   assert.equal(queries[0].exited, true, 'after the held one was closed');
   await untilExited(queries[1]);
+});
+
+test('the process records its tasks, tells about them starting and ending, and stops one on request', async () => {
+  const queries = installFakeSdk((query) => {
+    query.onInput = () => {
+      query.emit({ type: 'system', subtype: 'init', session_id: 'sid-10' });
+      query.emit({
+        type: 'system', subtype: 'task_started', task_id: 'task-a', tool_use_id: 'toolu_a',
+        description: 'List the files', subagent_type: 'Explore', task_type: 'subagent', uuid: 'u-1', session_id: 'sid-10',
+      });
+      query.emit({
+        type: 'system', subtype: 'task_progress', task_id: 'task-a', description: 'List the files',
+        usage: { total_tokens: 10, tool_uses: 1, duration_ms: 100 }, uuid: 'u-2', session_id: 'sid-10',
+      });
+      query.emit({ type: 'system', subtype: 'task_updated', task_id: 'task-a', patch: { is_backgrounded: true }, uuid: 'u-3', session_id: 'sid-10' });
+      query.emit({ type: 'result', subtype: 'success', session_id: 'sid-10' });
+    };
+  });
+  const writer = createWriter();
+  const sessions = new ClaudeSessionsProvider();
+  const context = createContext({ normalizeMessage: (raw, sessionId) => sessions.normalizeMessage(raw, sessionId) });
+  const changes: SessionProcessSnapshot[] = [];
+  const unsubscribe = onSessionProcessChange((snapshot) => changes.push(snapshot));
+
+  await queryClaudeSDK('list files', { sessionId: 'app-10' }, writer, context);
+
+  const frames = writer.frames.filter((frame) => frame.kind === 'task');
+  assert.deepEqual(frames.map((frame) => frame.status), ['started', 'running', 'running']);
+  assert.equal(frames[2].description, 'List the files', 'a patch frame goes out whole');
+  assert.equal(frames[2].agentType, 'Explore');
+  assert.equal(frames[2].background, true);
+  assert.deepEqual(frames[1].usage, { totalTokens: 10, toolUses: 1, durationMs: 100 });
+
+  const running = getSessionProcess('app-10')?.tasks ?? [];
+  assert.equal(running.length, 1);
+  assert.equal(running[0].taskId, 'task-a');
+  assert.equal(running[0].status, 'running');
+  assert.equal(running[0].background, true);
+  assert.equal(running[0].endedAt, undefined);
+  assert.deepEqual(changes.map((change) => change.tasks.length), [0, 1], 'announced once, when the task started');
+
+  // The turn is over; the background task reports in on its own.
+  assert.equal(await stopClaudeSDKTask('app-10', 'task-zzz'), false, 'not one of its tasks');
+  assert.equal(await stopClaudeSDKTask('app-10', 'task-a'), true);
+  assert.deepEqual(queries[0].stoppedTasks, ['task-a']);
+  queries[0].emit({
+    type: 'system', subtype: 'task_notification', task_id: 'task-a', tool_use_id: 'toolu_a', status: 'stopped',
+    output_file: '/tmp/x', summary: 'Stopped by the user', uuid: 'u-4', session_id: 'sid-10',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const ended = getSessionProcess('app-10')?.tasks ?? [];
+  assert.equal(ended[0].status, 'stopped');
+  assert.equal(ended[0].summary, 'Stopped by the user');
+  assert.equal(typeof ended[0].endedAt, 'number');
+  assert.equal(changes.length, 3, 'announced again when the task ended');
+  assert.equal(changes[2].tasks[0].status, 'stopped');
+  const last = writer.frames.filter((frame) => frame.kind === 'task').at(-1);
+  assert.equal(last?.status, 'stopped');
+  assert.equal(last?.description, 'List the files');
+
+  assert.equal(await stopClaudeSDKTask('app-11', 'task-a'), false, 'no process for that session');
+  await closeClaudeSDKSession('app-10');
+  unsubscribe();
 });
