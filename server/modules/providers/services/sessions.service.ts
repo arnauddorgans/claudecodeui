@@ -3,7 +3,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
-import { broadcastSessionUpserted, chatRunRegistry } from '@/modules/websocket/index.js';
+import { broadcastSessionUpserted, chatRunRegistry, sessionProcessRegistry } from '@/modules/websocket/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
 import type {
@@ -141,13 +141,13 @@ export const sessionsService = {
   },
 
   /**
-   * The processes providers keep alive between turns, one per session: a
-   * session can be idle yet still have its process, with background work of
-   * its own going on.
+   * Where sessions live: the processes providers keep alive between turns,
+   * and the terminals with a CLI resumed inside. A session can be idle yet
+   * still have its process, with background work of its own going on.
    */
   listSessionProcesses(): SessionProcessSnapshot[] {
-    return providerRegistry.listProviders().flatMap(
-      (provider) => provider.runtime.processes?.list() ?? [],
+    return sessionProcessRegistry.list(
+      providerRegistry.listProviders().flatMap((provider) => provider.runtime.processes?.list() ?? []),
     );
   },
 

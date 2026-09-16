@@ -225,3 +225,105 @@ test('a missing project directory is reported as an error frame and starts no pt
     [{ type: 'error', message: 'Invalid project path' }]
   );
 });
+
+// --- Where a session lives: the terminal in the registry, output to every client.
+
+import { sessionProcessRegistry } from '@/modules/websocket/services/session-process-registry.service.js';
+import { closeTerminalSession } from '@/modules/websocket/services/shell-websocket.service.js';
+
+test('a terminal resuming a session registers it, and every attached socket gets the output', () => {
+  const pty = createFakePty();
+  const dependencies = {
+    resolveProviderSessionId: () => 'provider-sid',
+    spawnPty: () => pty as never,
+  };
+  const sessionId = `term-${Date.now()}`;
+  const initMessage = JSON.stringify({
+    type: 'init',
+    projectPath: process.cwd(),
+    sessionId,
+    hasSession: true,
+    provider: 'claude',
+  });
+
+  const mac = createFakeSocket();
+  handleShellConnection(mac as never, dependencies);
+  mac.emit('message', initMessage);
+  assert.equal(sessionProcessRegistry.get(sessionId, () => null)?.state, 'terminal');
+
+  const phone = createFakeSocket();
+  handleShellConnection(phone as never, dependencies);
+  phone.emit('message', initMessage);
+  mac.frames.length = 0;
+  phone.frames.length = 0;
+
+  pty.emitData('shared-output');
+  assert.equal(mac.frames.length, 1, 'the first socket keeps the stream');
+  assert.equal(phone.frames.length, 1, 'the second gets it too');
+
+  phone.emit('close');
+  pty.emitData('after-phone-left');
+  assert.equal(mac.frames.length, 2);
+  assert.equal(pty.killed, false, 'a watcher remains');
+
+  pty.emitExit();
+  assert.equal(sessionProcessRegistry.get(sessionId, () => null), null, 'gone with the shell');
+});
+
+test('closeTerminalSession kills the PTY and clears the registry', () => {
+  const pty = createFakePty();
+  const dependencies = {
+    resolveProviderSessionId: () => 'provider-sid',
+    spawnPty: () => pty as never,
+  };
+  const sessionId = `term-close-${Date.now()}`;
+  const socket = createFakeSocket();
+  handleShellConnection(socket as never, dependencies);
+  socket.emit('message', JSON.stringify({
+    type: 'init', projectPath: process.cwd(), sessionId, hasSession: true, provider: 'claude',
+  }));
+
+  assert.equal(closeTerminalSession(sessionId), true);
+  assert.equal(pty.killed, true);
+  assert.equal(sessionProcessRegistry.isInTerminal(sessionId), false);
+  assert.match(socket.frames[socket.frames.length - 1], /Terminal closed/);
+  assert.equal(closeTerminalSession(sessionId), false, 'nothing left to close');
+});
+
+test('a plain shell is not a session process', () => {
+  const pty = createFakePty();
+  const dependencies = { resolveProviderSessionId: () => null, spawnPty: () => pty as never };
+  const sessionId = `plain-${Date.now()}`;
+  const socket = createFakeSocket();
+  handleShellConnection(socket as never, dependencies);
+  socket.emit('message', JSON.stringify({
+    type: 'init', projectPath: process.cwd(), sessionId, hasSession: false, provider: 'plain-shell', isPlainShell: true, initialCommand: 'ls',
+  }));
+  assert.equal(sessionProcessRegistry.isInTerminal(sessionId), false);
+  pty.emitExit();
+});
+
+test('under manual closing, resuming a session in a terminal closes its chat process first', async () => {
+  process.env.SESSION_PROCESS_CLOSE = 'manual';
+  try {
+    const pty = createFakePty();
+    const closed: string[] = [];
+    const dependencies = {
+      resolveProviderSessionId: () => 'provider-sid',
+      closeChatProcess: async (_provider: string, sessionId: string) => { closed.push(sessionId); return true; },
+      spawnPty: () => pty as never,
+    };
+    const sessionId = `takeover-${Date.now()}`;
+    const socket = createFakeSocket();
+    handleShellConnection(socket as never, dependencies);
+    socket.emit('message', JSON.stringify({
+      type: 'init', projectPath: process.cwd(), sessionId, hasSession: true, provider: 'claude',
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.deepEqual(closed, [sessionId]);
+    pty.emitExit();
+  } finally {
+    delete process.env.SESSION_PROCESS_CLOSE;
+  }
+});

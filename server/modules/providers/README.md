@@ -395,6 +395,9 @@ busy with that work: two processes resumed the same transcript and both appended
   old one is closed before the new one starts.
 - `processes` exposes the live processes (`get`, `list`, `onChange`, `closeAll`); the websocket
   gateway broadcasts every change as `session_process`, and the server closes them all on shutdown.
+  The gateway merges them with the terminals of `/shell` (`session-process-registry.service.ts`): a
+  session is in the chat or in a terminal, never both; under `manual` a terminal resuming a session
+  closes its chat process first.
 - Callers with no app session (the agent and git routes, over SSE) get a process for one turn,
   ended at its `result`.
 - **`SESSION_PROCESS_CLOSE`** (`shared/session-process-close.ts`) says who closes a session's process,

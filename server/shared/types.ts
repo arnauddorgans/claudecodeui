@@ -254,14 +254,14 @@ export type SessionUpsertedEvent = {
 };
 
 /**
- * A session's process as a provider that keeps one alive between turns
- * reports it. `state` is `chat` while the process is up and `off` once it has
- * gone; `turnActive` says whether a turn is in flight on it.
+ * A session's process: `chat` while its provider keeps one alive between
+ * turns, `terminal` while a `/shell` PTY has the provider's CLI resumed on it,
+ * `off` once it has gone. `turnActive` says whether a chat turn is in flight.
  */
 export type SessionProcessSnapshot = {
   sessionId: string;
   provider: LLMProvider;
-  state: 'chat' | 'off';
+  state: 'chat' | 'terminal' | 'off';
   /** Epoch milliseconds when the process started. */
   since: number;
   providerSessionId: string | null;

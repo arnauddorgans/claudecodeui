@@ -5,7 +5,9 @@ import path from 'node:path';
 import pty, { type IPty } from 'node-pty';
 import { WebSocket, type RawData } from 'ws';
 
+import { sessionProcessRegistry } from '@/modules/websocket/services/session-process-registry.service.js';
 import { resolvePtySessionTimeoutMs, resolveSessionProcessClose } from '@/shared/session-process-close.js';
+import type { LLMProvider } from '@/shared/types.js';
 import { parseIncomingJsonObject } from '@/shared/utils.js';
 
 type ShellIncomingMessage = {
@@ -25,11 +27,18 @@ type ShellIncomingMessage = {
 
 type PtySessionEntry = {
   pty: IPty;
-  ws: WebSocket | null;
+  /**
+   * Every socket watching this PTY. A session open on the Mac and on a phone
+   * shows the same terminal in both; the newest socket used to take the
+   * output away from the others.
+   */
+  clients: Set<WebSocket>;
   buffer: string[];
   timeoutId: NodeJS.Timeout | null;
   projectPath: string;
   sessionId: string | null;
+  /** The app session whose CLI runs in this PTY, when it is one (not a plain shell). */
+  registeredSessionId: string | null;
 };
 
 const ptySessionsMap = new Map<string, PtySessionEntry>();
@@ -40,6 +49,47 @@ const ptySessionsMap = new Map<string, PtySessionEntry>();
  */
 function ptySessionTimeoutMs(): number {
   return resolveSessionProcessClose() === 'manual' ? 0 : resolvePtySessionTimeoutMs();
+}
+
+function sendToClients(session: PtySessionEntry, payload: string): void {
+  for (const client of session.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    } else {
+      session.clients.delete(client);
+    }
+  }
+}
+
+function forgetPtySession(key: string, session: PtySessionEntry): void {
+  if (session.timeoutId) {
+    clearTimeout(session.timeoutId);
+    session.timeoutId = null;
+  }
+  if (ptySessionsMap.get(key) === session) {
+    ptySessionsMap.delete(key);
+  }
+  if (session.registeredSessionId) {
+    sessionProcessRegistry.terminalClosed(session.registeredSessionId);
+  }
+}
+
+/**
+ * Ends the terminal a session lives in: `chat.close` on a session in a
+ * terminal, or "Continue in chat". False when the session has no terminal.
+ */
+export function closeTerminalSession(sessionId: string): boolean {
+  let closed = false;
+  for (const [key, session] of ptySessionsMap.entries()) {
+    if (session.registeredSessionId !== sessionId) {
+      continue;
+    }
+    sendToClients(session, JSON.stringify({ type: 'output', data: '\r\n\x1b[33m[Terminal closed]\x1b[0m\r\n' }));
+    forgetPtySession(key, session);
+    session.pty.kill();
+    closed = true;
+  }
+  return closed;
 }
 const SHELL_URL_PARSE_BUFFER_LIMIT = 32768;
 const ANSI_ESCAPE_SEQUENCE_REGEX = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g;
@@ -114,6 +164,12 @@ type ShellWebSocketDependencies = {
     sessionId: string,
     provider: string,
   ) => string | null | undefined;
+  /**
+   * Ends the session's chat process before its CLI is resumed in a terminal:
+   * the two cannot share a transcript. Only called under
+   * `SESSION_PROCESS_CLOSE=manual`, where a chat process outlives its turn.
+   */
+  closeChatProcess?: (provider: string, sessionId: string) => Promise<boolean>;
   spawnPty?: typeof pty.spawn;
 };
 
@@ -349,11 +405,8 @@ export function handleShellConnection(
         if (isLoginCommand || forceRestart) {
           const oldSession = ptySessionsMap.get(ptySessionKey);
           if (oldSession) {
-            if (oldSession.timeoutId) {
-              clearTimeout(oldSession.timeoutId);
-            }
+            forgetPtySession(ptySessionKey, oldSession);
             oldSession.pty.kill();
-            ptySessionsMap.delete(ptySessionKey);
           }
         }
 
@@ -384,7 +437,7 @@ export function handleShellConnection(
             });
           }
 
-          existingSession.ws = ws;
+          existingSession.clients.add(ws);
           return;
         }
 
@@ -407,6 +460,13 @@ export function handleShellConnection(
 
         const shellCommand = buildShellCommand(data, dependencies);
         const resumeSessionId = resolveResumeSessionId(data, dependencies);
+        // The app session this terminal takes over, if it is one.
+        const registeredSessionId = hasSession && sessionId && !isPlainShell ? sessionId : null;
+        if (registeredSessionId && resolveSessionProcessClose() === 'manual' && dependencies.closeChatProcess) {
+          // A chat process kept alive between turns cannot share the
+          // transcript with the CLI about to resume it here.
+          await dependencies.closeChatProcess(provider, registeredSessionId);
+        }
         const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
         const shellArgs =
           os.platform() === 'win32' ? ['-Command', shellCommand] : ['-c', shellCommand];
@@ -428,14 +488,19 @@ export function handleShellConnection(
           },
         });
 
-        ptySessionsMap.set(ptySessionKey, {
+        const entry: PtySessionEntry = {
           pty: shellProcess,
-          ws,
+          clients: new Set([ws]),
           buffer: [],
           timeoutId: null,
           projectPath,
           sessionId,
-        });
+          registeredSessionId,
+        };
+        ptySessionsMap.set(ptySessionKey, entry);
+        if (registeredSessionId) {
+          sessionProcessRegistry.terminalOpened(registeredSessionId, provider as LLMProvider);
+        }
 
         shellProcess.onData((chunk) => {
           if (!ptySessionKey) {
@@ -454,7 +519,7 @@ export function handleShellConnection(
             session.buffer.push(chunk);
           }
 
-          if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+          if (session.clients.size > 0) {
             let outputData = chunk;
             const cleanChunk = stripAnsiSequences(chunk);
             urlDetectionBuffer = `${urlDetectionBuffer}${cleanChunk}`.slice(-SHELL_URL_PARSE_BUFFER_LIMIT);
@@ -473,7 +538,8 @@ export function handleShellConnection(
               const isNewUrl = !announcedAuthUrls.has(normalizedUrl);
               if (isNewUrl) {
                 announcedAuthUrls.add(normalizedUrl);
-                session.ws?.send(
+                sendToClients(
+                  session,
                   JSON.stringify({
                     type: 'auth_url',
                     url: normalizedUrl,
@@ -504,7 +570,8 @@ export function handleShellConnection(
               emitAuthUrl(bestUrl, true);
             }
 
-            session.ws.send(
+            sendToClients(
+              session,
               JSON.stringify({
                 type: 'output',
                 data: outputData,
@@ -523,8 +590,9 @@ export function handleShellConnection(
             return;
           }
 
-          if (session && session.ws && session.ws.readyState === WebSocket.OPEN) {
-            session.ws.send(
+          if (session) {
+            sendToClients(
+              session,
               JSON.stringify({
                 type: 'output',
                 data: `\r\n\x1b[33mProcess exited with code ${exitCode.exitCode}${
@@ -532,13 +600,9 @@ export function handleShellConnection(
                 }\x1b[0m\r\n`,
               })
             );
+            forgetPtySession(ptySessionKey, session);
           }
 
-          if (session?.timeoutId) {
-            clearTimeout(session.timeoutId);
-          }
-
-          ptySessionsMap.delete(ptySessionKey);
           shellProcess = null;
         });
 
@@ -603,12 +667,13 @@ export function handleShellConnection(
     }
 
     // Mobile networks can deliver an old socket's close after its replacement
-    // has attached. Only the socket that currently owns the PTY may detach it.
-    if (session.ws !== ws) {
+    // has attached; a socket only ever removes itself, and the PTY stays while
+    // anyone watches.
+    session.clients.delete(ws);
+    if (session.clients.size > 0) {
       return;
     }
 
-    session.ws = null;
     if (session.timeoutId) {
       clearTimeout(session.timeoutId);
       session.timeoutId = null;
@@ -619,13 +684,13 @@ export function handleShellConnection(
     }
     session.timeoutId = setTimeout(() => {
       // A reconnect may win just as this timer becomes runnable. Re-check the
-      // active socket so a queued cleanup can never kill a reattached PTY.
-      if (ptySessionsMap.get(ptySessionKey as string) !== session || session.ws !== null) {
+      // audience so a queued cleanup can never kill a reattached PTY.
+      if (ptySessionsMap.get(ptySessionKey as string) !== session || session.clients.size > 0) {
         return;
       }
 
+      forgetPtySession(ptySessionKey as string, session);
       session.pty.kill();
-      ptySessionsMap.delete(ptySessionKey as string);
     }, timeoutMs);
   });
 

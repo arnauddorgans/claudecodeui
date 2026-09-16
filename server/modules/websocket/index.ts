@@ -6,6 +6,7 @@ export { chatRunRegistry } from './services/chat-run-registry.service.js';
 // uses, so both paths put the identical delta on the wire.
 export { broadcastSessionUpserted, broadcastSessionUpsertedBatch } from './services/session-upsert-broadcast.service.js';
 export { broadcastSessionProcess } from './services/session-process-broadcast.service.js';
+export { sessionProcessRegistry } from './services/session-process-registry.service.js';
 // runDetachedChatTurn: used by the scheduled-messages module to run a turn
 // from a timer, with no socket to stream to or report errors on.
 export { runDetachedChatTurn } from './services/chat-websocket.service.js';

@@ -156,3 +156,54 @@ test('chat_subscribed carries the session process', async () => {
     assert.equal(ack.isProcessing, false);
   });
 });
+
+// --- A session living in a terminal.
+
+import { sessionProcessRegistry } from '@/modules/websocket/services/session-process-registry.service.js';
+
+test('under manual closing, chat.send is refused while the session lives in a terminal', async () => {
+  process.env.SESSION_PROCESS_CLOSE = 'manual';
+  try {
+    await withGateway(null, async ({ socket }) => {
+      sessionProcessRegistry.terminalOpened(SESSION_ID, 'claude');
+      socket.emit('message', JSON.stringify({ type: 'chat.send', sessionId: SESSION_ID, content: 'hello' }));
+      await settle();
+
+      assert.equal(socket.frames.some((frame) => frame.kind === 'protocol_error' && frame.code === 'SESSION_IN_TERMINAL'), true);
+      assert.equal(chatRunRegistry.isProcessing(SESSION_ID), false);
+    });
+  } finally {
+    delete process.env.SESSION_PROCESS_CLOSE;
+    sessionProcessRegistry.clearAll();
+  }
+});
+
+test('chat_subscribed reports the terminal over the chat process', async () => {
+  try {
+    await withGateway(liveProcess, async ({ socket }) => {
+      sessionProcessRegistry.terminalOpened(SESSION_ID, 'claude');
+      socket.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [{ sessionId: SESSION_ID }] }));
+      await settle();
+
+      const ack = socket.frames.find((frame) => frame.kind === 'chat_subscribed');
+      assert.equal((ack?.process as { state?: string })?.state, 'terminal');
+    });
+  } finally {
+    sessionProcessRegistry.clearAll();
+  }
+});
+
+test('opening and closing a terminal is broadcast to every chat client', async () => {
+  try {
+    await withGateway(null, async ({ socket }) => {
+      sessionProcessRegistry.terminalOpened(SESSION_ID, 'claude');
+      sessionProcessRegistry.terminalClosed(SESSION_ID);
+      await settle();
+
+      const states = socket.frames.filter((frame) => frame.kind === 'session_process').map((frame) => frame.state);
+      assert.deepEqual(states, ['terminal', 'off']);
+    });
+  } finally {
+    sessionProcessRegistry.clearAll();
+  }
+});

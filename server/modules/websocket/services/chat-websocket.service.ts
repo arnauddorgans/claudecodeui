@@ -5,6 +5,8 @@ import type { WebSocket } from 'ws';
 import { sessionsDb } from '@/modules/database/index.js';
 import { providerModelsService, sessionsService } from '@/modules/providers/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
+import { sessionProcessRegistry } from '@/modules/websocket/services/session-process-registry.service.js';
+import { closeTerminalSession } from '@/modules/websocket/services/shell-websocket.service.js';
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import {
   getGlobalImageAssetsDir,
@@ -20,6 +22,7 @@ import type {
   ProviderRuntimeWriter,
   SessionProcessSnapshot,
 } from '@/shared/types.js';
+import { resolveSessionProcessClose } from '@/shared/session-process-close.js';
 import { parseIncomingJsonObject } from '@/shared/utils.js';
 
 /**
@@ -198,6 +201,19 @@ function resolveSendTarget(
   const provider = session.provider as LLMProvider;
   if (!dependencies.runtime.hasRuntime(provider)) {
     sendProtocolError(ws, 'UNSUPPORTED_PROVIDER', `Provider "${provider}" is not available.`, sessionId);
+    return null;
+  }
+
+  // Under manual closing a session lives in one place: its CLI resumed in a
+  // terminal cannot share the transcript with a chat process. Closing the
+  // terminal (`chat.close`, "Continue in chat") is the explicit step.
+  if (resolveSessionProcessClose() === 'manual' && sessionProcessRegistry.isInTerminal(sessionId)) {
+    sendProtocolError(
+      ws,
+      'SESSION_IN_TERMINAL',
+      `Session "${sessionId}" is open in a terminal. Close it before sending from the chat.`,
+      sessionId
+    );
     return null;
   }
 
@@ -443,11 +459,11 @@ async function handleChatAbort(
 }
 
 /**
- * Handles `chat.close`: ends the session's process. A turn in flight is
- * interrupted first and its terminal `complete` emitted here, as `chat.abort`
- * does; everyone learns the process is gone from the `session_process`
- * broadcast. Providers that keep no process between turns have nothing to
- * close, which is not an error.
+ * Handles `chat.close`: ends the session's process, in the chat or in a
+ * terminal. A turn in flight is interrupted first and its terminal `complete`
+ * emitted here, as `chat.abort` does; everyone learns the process is gone
+ * from the `session_process` broadcast. Providers that keep no process
+ * between turns have nothing to close, which is not an error.
  */
 async function handleChatClose(
   ws: WebSocket,
@@ -474,6 +490,7 @@ async function handleChatClose(
 
   const wasRunning = chatRunRegistry.isProcessing(sessionId);
   await dependencies.runtime.close(provider, sessionId);
+  closeTerminalSession(sessionId);
   if (wasRunning) {
     chatRunRegistry.completeRun(sessionId, { exitCode: 0, aborted: true });
   }
@@ -531,7 +548,7 @@ function handleChatSubscribe(
       isProcessing,
       lastSeq: run?.lastSeq ?? 0,
       pendingPermissions,
-      process: dependencies.runtime.getSessionProcess(sessionId),
+      process: sessionProcessRegistry.get(sessionId, dependencies.runtime.getSessionProcess),
       timestamp: new Date().toISOString(),
     });
 

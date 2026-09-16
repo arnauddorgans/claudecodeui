@@ -16,6 +16,7 @@ import {
     providerRuntimeService,
 } from '@/modules/providers/index.js';
 import { createWebSocketServer } from '@/modules/websocket/index.js';
+import type { LLMProvider } from '@/shared/types.js';
 
 import { getConnectableHost } from '../shared/networkHosts.js';
 
@@ -108,6 +109,8 @@ createWebSocketServer(server, {
         runtime: providerRuntimeService,
     },
     shell: {
+        // A terminal resuming a session takes it over from its chat process.
+        closeChatProcess: (provider, sessionId) => providerRuntimeService.close(provider as LLMProvider, sessionId),
         resolveProviderSessionId: (sessionId, provider) => {
             const dbSession = sessionsDb.getSessionById(sessionId);
             if (dbSession) {
