@@ -353,6 +353,43 @@ function describeProcess(proc, state = 'chat') {
 
 const ENDED_TASK_STATUSES = new Set(['completed', 'failed', 'stopped']);
 
+/** How many `tool_use` ids a process remembers the parent of (see `rememberToolUseParents`). */
+const TOOL_USE_PARENTS_LIMIT = 2000;
+
+/**
+ * Remembers, for every `tool_use` block of an assistant message, the agent
+ * that issued it: the message's top-level `parent_tool_use_id` (the `Agent`
+ * call) for a subagent's traffic, null on the main thread.
+ *
+ * The SDK's task events never carry `parent_tool_use_id`, so without this a
+ * background `Bash` started inside a subagent would look like the session's
+ * own; `recordTask` reads the map back through the task's `toolUseId`. Bounded
+ * to the last TOOL_USE_PARENTS_LIMIT ids, in stream order.
+ * @param {Object} proc - Session process
+ * @param {Object} sdkMessage - SDK stream message
+ */
+function rememberToolUseParents(proc, sdkMessage) {
+  if (sdkMessage?.type !== 'assistant') {
+    return;
+  }
+  const content = sdkMessage.message?.content;
+  if (!Array.isArray(content)) {
+    return;
+  }
+  const parent = typeof sdkMessage.parent_tool_use_id === 'string' ? sdkMessage.parent_tool_use_id : null;
+  for (const block of content) {
+    if (block?.type !== 'tool_use' || typeof block.id !== 'string') {
+      continue;
+    }
+    // Re-insert so a repeated id (streamed partials) stays among the newest.
+    proc.toolUseParents.delete(block.id);
+    proc.toolUseParents.set(block.id, parent);
+    if (proc.toolUseParents.size > TOOL_USE_PARENTS_LIMIT) {
+      proc.toolUseParents.delete(proc.toolUseParents.keys().next().value);
+    }
+  }
+}
+
 /**
  * Keeps the process's record of a task up to date from one of the SDK's task
  * events, already normalized into a `task` message. The record outlives the
@@ -377,9 +414,16 @@ function recordTask(proc, msg) {
   }
 
   const wasEnded = ENDED_TASK_STATUSES.has(task.status);
-  for (const key of ['toolUseId', 'description', 'taskType', 'agentType', 'summary', 'usage']) {
+  for (const key of ['toolUseId', 'parentToolUseId', 'description', 'taskType', 'agentType', 'summary', 'usage']) {
     if (msg[key] !== undefined) {
       task[key] = msg[key];
+    }
+  }
+  // The event names no parent; the tool call that started the task may (see `rememberToolUseParents`).
+  if (task.parentToolUseId === undefined && task.toolUseId) {
+    const parent = proc.toolUseParents.get(task.toolUseId);
+    if (parent) {
+      task.parentToolUseId = parent;
     }
   }
   if (typeof msg.background === 'boolean') {
@@ -953,6 +997,9 @@ async function launchSessionProcess(spec) {
     startedAt: Date.now(),
     // Every task the process ran, by task id (see `recordTask`).
     tasks: new Map(),
+    // `tool_use` id -> the agent's tool call it ran under, null on the main
+    // thread (see `rememberToolUseParents`).
+    toolUseParents: new Map(),
     turn: null,
     closing: false,
     exited: null,
@@ -1215,6 +1262,8 @@ function handleProcessMessage(proc, message) {
   const turn = proc.turn;
   const writer = proc.writer;
   const sid = eventSessionIdOf(proc);
+
+  rememberToolUseParents(proc, message);
 
   // Transform and normalize message via adapter
   const transformedMessage = transformMessage(message);

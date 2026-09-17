@@ -433,6 +433,14 @@ optional) calls the SDK's `stopTask` on the session's process; the CLI answers w
 `task_notification` of status `stopped`, which ends the record like any other. It refuses (false)
 a session without a live process or a task the process never reported.
 
+The SDK's task events never say which agent started the task: a `Bash` backgrounded inside a
+subagent arrives with no `parent_tool_use_id`, while the `tool_use` block that spawned it came in an
+assistant message carrying the `Agent` call's id at the top level. So the runtime remembers, per
+process, the parent of every `tool_use` id it sees on the stream (`rememberToolUseParents`, the last
+2000 ids) and, when a task's own event names no parent, fills `parentToolUseId` from that map
+through the task's `toolUseId`, on the outgoing `task` frame and on the record alike. A task of the
+session's own thread stays without one.
+
 Each subagent's own transcript sits next to the session's, at
 `<claudeHome>/projects/<encoded cwd>/<providerSessionId>/subagents/agent-<agentId>.jsonl` with an
 `agent-<agentId>.meta.json` beside it (`agentType`, `description`, `toolUseId`).

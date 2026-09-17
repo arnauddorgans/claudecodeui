@@ -155,8 +155,11 @@ flowchart TD
    (a `task_updated` only carries a patch) from the process's own record. That record rides on
    `session_process.tasks`, `chat_subscribed.process.tasks` and `GET /api/providers/sessions/running`
    (`SessionProcessTask` in `shared/types.ts`), ended tasks included, and a `session_process` is
-   broadcast when a task starts or ends, so a client subscribing later still sees what ran. Clients
-   that do not know the `task` kind ignore it, as they do every unknown kind.
+   broadcast when a task starts or ends, so a client subscribing later still sees what ran.
+   `parentToolUseId` is the `Agent` call the task ran under, when it ran inside a subagent (the
+   runtime derives it from the `tool_use` block that started the task, the SDK's task events not
+   carrying it); a task of the session's own thread has none. Clients that do not know the `task`
+   kind ignore it, as they do every unknown kind.
    `chat.stop-task { sessionId, taskId }` stops one task through the SDK's control channel; the task
    then ends as a `task` frame with `status: "stopped"`. Protocol errors: `TASK_ID_REQUIRED`,
    `SESSION_NOT_FOUND`, `UNSUPPORTED_PROVIDER`, `NO_PROCESS` (no chat process, or the session is in a

@@ -274,6 +274,8 @@ export type SessionProcessTask = {
   taskId: string;
   /** The tool call that started it, when the provider reports one. */
   toolUseId?: string;
+  /** The tool call of the agent this task ran under, when it ran under one. */
+  parentToolUseId?: string;
   description: string;
   /** Provider label for the task's kind (`subagent`, `shell`, ...). */
   taskType?: string;

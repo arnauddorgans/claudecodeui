@@ -397,3 +397,52 @@ test('the process records its tasks, tells about them starting and ending, and s
   await closeClaudeSDKSession('app-10');
   unsubscribe();
 });
+
+test('a task started inside a subagent carries the agent call it ran under', async () => {
+  installFakeSdk((query) => {
+    query.onInput = () => {
+      query.emit({ type: 'system', subtype: 'init', session_id: 'sid-12' });
+      // The subagent's Bash call: the message names the Agent call, the task event never does.
+      query.emit({
+        type: 'assistant', session_id: 'sid-12', parent_tool_use_id: 'toolu_agent',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_bash', name: 'Bash', input: { command: 'sleep 60', run_in_background: true } }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      });
+      query.emit({
+        type: 'system', subtype: 'task_started', task_id: 'task-bash', tool_use_id: 'toolu_bash',
+        description: 'sleep 60', task_type: 'local_bash', uuid: 'u-1', session_id: 'sid-12',
+      });
+      // The session's own Bash call, on the main thread.
+      query.emit({
+        type: 'assistant', session_id: 'sid-12',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_main', name: 'Bash', input: { command: 'sleep 30', run_in_background: true } }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      });
+      query.emit({
+        type: 'system', subtype: 'task_started', task_id: 'task-main', tool_use_id: 'toolu_main',
+        description: 'sleep 30', task_type: 'local_bash', uuid: 'u-2', session_id: 'sid-12',
+      });
+      query.emit({ type: 'result', subtype: 'success', session_id: 'sid-12' });
+    };
+  });
+  const writer = createWriter();
+  const sessions = new ClaudeSessionsProvider();
+  const context = createContext({ normalizeMessage: (raw, sessionId) => sessions.normalizeMessage(raw, sessionId) });
+
+  await queryClaudeSDK('run it', { sessionId: 'app-12' }, writer, context);
+
+  const frames = writer.frames.filter((frame) => frame.kind === 'task');
+  assert.deepEqual(frames.map((frame) => [frame.taskId, frame.parentToolUseId]), [['task-bash', 'toolu_agent'], ['task-main', undefined]]);
+
+  const tasks = getSessionProcess('app-12')?.tasks ?? [];
+  assert.deepEqual(tasks.map((task) => [task.taskId, task.parentToolUseId]), [['task-bash', 'toolu_agent'], ['task-main', undefined]]);
+  assert.equal(Object.hasOwn(tasks[1], 'parentToolUseId'), false, 'a main-thread task has no parent at all');
+
+  await closeClaudeSDKSession('app-12');
+});
