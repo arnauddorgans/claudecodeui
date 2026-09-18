@@ -648,6 +648,51 @@ function isInternalContent(content: string): boolean {
 }
 
 /**
+ * True for the CLI's own note about an image it resized before showing it to
+ * the model (wording like "[Image: original WxH, displayed at ...]") — never
+ * something the user typed. It arrives as its own synthetic user-role row
+ * beside the turn that carried the image, either the user's own attachment or
+ * a tool result (`Read` on an oversized file, most commonly).
+ *
+ * The persisted transcript marks the row `isMeta: true`; the live SDK stream
+ * marks the same bit `isSynthetic: true` instead — `isMeta` is the CLI's own
+ * field and never made it into the SDK's typed `SDKUserMessage` shape, the
+ * same live/persisted split documented above `isInternalContent` for skill
+ * bodies. Detected structurally, never by reading the note's wording: a
+ * skill body is the other content the CLI tags this way, and it carries a
+ * `sourceToolUseID` linking it back to the tool call that caused it, which
+ * this note never does — that absence, not the text, is what tells them
+ * apart.
+ */
+function isGeneratedImageNote(raw: AnyRecord): boolean {
+  if (raw.message?.role !== 'user' || raw.sourceToolUseID) {
+    return false;
+  }
+  if (raw.isMeta !== true && raw.isSynthetic !== true) {
+    return false;
+  }
+  const content = raw.message.content;
+  if (typeof content === 'string') {
+    return content.trim().length > 0;
+  }
+  if (Array.isArray(content)) {
+    return content.length > 0 && content.every((part: AnyRecord) => part?.type === 'text');
+  }
+  return false;
+}
+
+/** Joins a generated image note's content (string or text-only parts) into plain text. */
+function readGeneratedImageNoteText(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map((part: AnyRecord) => (typeof part?.text === 'string' ? part.text : '')).join('\n').trim();
+  }
+  return '';
+}
+
+/**
  * Claude wraps local slash-command metadata in lightweight XML-like tags inside
  * a plain string payload. We intentionally parse only the small tag surface we
  * care about instead of introducing a generic XML parser for untrusted history.
@@ -863,6 +908,26 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     const messages: NormalizedMessage[] = [];
     const ts = raw.timestamp || new Date().toISOString();
     const baseId = raw.uuid || generateMessageId('claude');
+
+    if (isGeneratedImageNote(raw)) {
+      const text = readGeneratedImageNoteText(raw.message.content);
+      if (text) {
+        messages.push(createNormalizedMessage({
+          id: baseId,
+          sessionId,
+          timestamp: ts,
+          provider: PROVIDER,
+          kind: 'text',
+          role: 'user',
+          content: text,
+          // Presentation-only: the row stays in the transcript file and in
+          // whatever the model receives, unchanged. A client drops it by
+          // reading this flag, never by matching the note's own wording.
+          generated: true,
+        }));
+      }
+      return messages;
+    }
 
     if (raw.message?.role === 'user' && raw.message?.content && raw.isMeta !== true) {
       if (Array.isArray(raw.message.content)) {

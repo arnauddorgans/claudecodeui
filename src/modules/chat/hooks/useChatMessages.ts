@@ -199,6 +199,11 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
 
     switch (msg.kind) {
       case 'text': {
+        // The CLI's own note about an image it resized, not something the
+        // user typed — flagged by the backend, dropped here by that flag
+        // rather than by matching its wording.
+        if (msg.generated) break;
+
         const content = msg.content || '';
         const images = Array.isArray(msg.images) && msg.images.length > 0 ? msg.images : undefined;
         const files = Array.isArray(msg.files) && msg.files.length > 0 ? msg.files : undefined;

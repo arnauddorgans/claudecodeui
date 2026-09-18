@@ -749,6 +749,14 @@ export function useSessionStore() {
   }, [notify]);
 
   const appendRealtime = useCallback((sessionId: string, msg: NormalizedMessage) => {
+    // The CLI's own note about an image it resized streams as an ordinary
+    // user-role text row; skip it here rather than in the presentation layer
+    // so it never inflates the user-turn counts the reconciliation helpers
+    // below compute from `realtimeMessages`.
+    if (msg.generated) {
+      return;
+    }
+
     const slot = getSlot(sessionId);
     const normalizedMessage =
       msg.sessionId === sessionId

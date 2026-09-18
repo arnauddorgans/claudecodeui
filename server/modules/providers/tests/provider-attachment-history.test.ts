@@ -71,6 +71,135 @@ test('claude history: plain text user turns carry no images field', () => {
   assert.equal(messages[0].images, undefined);
 });
 
+test('claude history: the CLI\'s persisted image-resize note is flagged generated, not dropped', () => {
+  const provider = new ClaudeSessionsProvider();
+  // Shape written to the JSONL transcript: its own row, `isMeta`+`turnCompanion`
+  // true, content is the note text only — never merged into the turn that
+  // carried the image.
+  const entry = {
+    uuid: 'u-note-history',
+    parentUuid: 'u-image-turn',
+    timestamp: '2026-07-03T10:00:01.000Z',
+    type: 'user',
+    isMeta: true,
+    turnCompanion: true,
+    message: {
+      role: 'user',
+      content: '[Image: original 1200x3000, displayed at 800x2000. Multiply coordinates by 1.50 to map to original image.]',
+    },
+  };
+
+  const messages = provider.normalizeMessage(entry, SESSION_ID);
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].kind, 'text');
+  assert.equal(messages[0].role, 'user');
+  assert.equal(messages[0].generated, true);
+  assert.match(messages[0].content || '', /original 1200x3000/);
+});
+
+test('claude live: the same note streams with isSynthetic instead of isMeta, and is flagged the same way', () => {
+  const provider = new ClaudeSessionsProvider();
+  // Shape the SDK actually streams live: `isSynthetic` rather than `isMeta`
+  // (isMeta never made it into the SDK's typed SDKUserMessage), content as a
+  // text-only part array rather than a bare string.
+  const entry = {
+    type: 'user',
+    isSynthetic: true,
+    message: {
+      role: 'user',
+      content: [
+        { type: 'text', text: '[Image: original 1200x3000, displayed at 800x2000. Multiply coordinates by 1.50 to map to original image.]' },
+      ],
+    },
+    parent_tool_use_id: null,
+    session_id: 'provider-session-1',
+    uuid: 'u-note-live',
+    timestamp: '2026-07-03T10:00:01.000Z',
+  };
+
+  const messages = provider.normalizeMessage(entry, SESSION_ID);
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, 'user');
+  assert.equal(messages[0].generated, true);
+  assert.match(messages[0].content || '', /original 1200x3000/);
+});
+
+test('claude history: a skill-body injection keeps its existing isMeta drop, unaffected by the new flag', () => {
+  const provider = new ClaudeSessionsProvider();
+  // Also isMeta + turnCompanion + pure text, but carries `sourceToolUseID`
+  // linking it back to the Skill tool call — the field that tells it apart
+  // from the tool's image note, which never has one.
+  const entry = {
+    uuid: 'u-skill-body',
+    timestamp: '2026-07-03T10:00:01.000Z',
+    type: 'user',
+    isMeta: true,
+    turnCompanion: true,
+    sourceToolUseID: 'toolu_skill_1',
+    message: {
+      role: 'user',
+      content: 'Base directory for this skill: /Users/x/.claude/skills/graphify\n\n# /graphify',
+    },
+  };
+
+  const messages = provider.normalizeMessage(entry, SESSION_ID);
+  assert.equal(messages.length, 0);
+});
+
+test('claude live/history: a user turn with an image and no CLI note carries no generated flag', () => {
+  const provider = new ClaudeSessionsProvider();
+  const entry = {
+    uuid: 'u-plain-image',
+    timestamp: '2026-07-03T10:00:00.000Z',
+    message: {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is in this screenshot?' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'QUJD' } },
+      ],
+    },
+  };
+
+  const messages = provider.normalizeMessage(entry, SESSION_ID);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].generated, undefined);
+});
+
+test('claude history: a plain text turn with no image carries no generated flag', () => {
+  const provider = new ClaudeSessionsProvider();
+  const entry = {
+    uuid: 'u-plain-text',
+    timestamp: '2026-07-03T10:00:00.000Z',
+    message: { role: 'user', content: 'just a normal message' },
+  };
+
+  const messages = provider.normalizeMessage(entry, SESSION_ID);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].generated, undefined);
+});
+
+test('claude history: user-typed text with square brackets is never marked generated', () => {
+  const provider = new ClaudeSessionsProvider();
+  // No isMeta/isSynthetic marker at all — a real user row, even though its
+  // own wording happens to look like the CLI's note. The detector must not
+  // be fooled by the text shape alone.
+  const entry = {
+    uuid: 'u-brackets',
+    timestamp: '2026-07-03T10:00:00.000Z',
+    message: {
+      role: 'user',
+      content: '[Image: original 100x100, displayed at 100x100] please check this section',
+    },
+  };
+
+  const messages = provider.normalizeMessage(entry, SESSION_ID);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].generated, undefined);
+  assert.equal(messages[0].content, '[Image: original 100x100, displayed at 100x100] please check this section');
+});
+
 test('claude history: file reference blocks restore non-image attachments', () => {
   const provider = new ClaudeSessionsProvider();
   const entry = {

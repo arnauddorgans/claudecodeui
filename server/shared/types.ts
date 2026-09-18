@@ -379,6 +379,15 @@ export type NormalizedMessage = {
   isLocalCommand?: boolean;
   isLocalCommandStdout?: boolean;
   isCompactSummary?: boolean;
+  /**
+   * True for a user-role row the CLI itself injected rather than something
+   * the person typed — today, Claude's own note about an image it resized
+   * before showing it to the model. The row is still sent in full so a
+   * client that wants to inspect it can; this is only a hint that the
+   * default presentation should skip it, the same way `isCompactSummary`
+   * hints at different styling rather than removing the row.
+   */
+  generated?: boolean;
   images?: unknown;
   /** Non-image files attached to a user turn after provider history normalization. */
   files?: unknown;

@@ -453,6 +453,12 @@ export type NormalizedMessage = {
   isLocalCommand?: boolean;
   isLocalCommandStdout?: boolean;
   isCompactSummary?: boolean;
+  /**
+   * True for a user-role row the CLI itself injected rather than something
+   * the person typed (today: Claude's own note about an image it resized).
+   * The chat conversion drops these instead of rendering them as a bubble.
+   */
+  generated?: boolean;
   images?: Array<{ path?: string; data?: string; name?: string }>;
   files?: Array<{ path?: string; name?: string; mimeType?: string; size?: number }>;
   toolName?: string;

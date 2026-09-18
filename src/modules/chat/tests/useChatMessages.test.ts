@@ -130,3 +130,27 @@ test('preserves both UI objects produced by an unchanged task notification', () 
   assert.equal(updated[0]?.isTaskNotification, true);
   assert.equal(updated[1]?.content, 'Detailed result');
 });
+
+test('drops a user-role row the backend flagged generated, keeping surrounding messages', () => {
+  const userPrompt = message('user-prompt', {
+    role: 'user',
+    content: 'What is in this screenshot?',
+  });
+  const generatedNote = message('image-note', {
+    role: 'user',
+    generated: true,
+    content: '[Image: original 1200x3000, displayed at 800x2000. Multiply coordinates by 1.50 to map to original image.]',
+  });
+  const reply = message('assistant-reply', {
+    role: 'assistant',
+    content: 'Looks like a gradient.',
+  });
+
+  const converted = normalizedToChatMessages([userPrompt, generatedNote, reply]);
+
+  assert.equal(converted.length, 2);
+  assert.equal(converted[0]?.type, 'user');
+  assert.equal(converted[0]?.content, 'What is in this screenshot?');
+  assert.equal(converted[1]?.type, 'assistant');
+  assert.equal(converted[1]?.content, 'Looks like a gradient.');
+});
