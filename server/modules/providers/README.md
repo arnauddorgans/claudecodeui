@@ -411,6 +411,17 @@ busy with that work: two processes resumed the same transcript and both appended
   nothing closes without a request.
   In both modes a session never has two processes: the next turn waits for the previous process to be
   gone before starting its own.
+- **`SESSION_PROCESS_EXTERNAL_PROCESSES`** (`shared/session-process-external.ts`), default off. When
+  `true`, the Claude runtime installs the SDK's `spawnClaudeCodeProcess` hook to capture the pid of the
+  CLI process it spawns, and every snapshot (`describeProcess`) walks the process table
+  (`shared/external-process-tree.ts`) from that pid and reports its live OS descendants as
+  `externalProcesses: [{ pid, name, startedAt }]` — a screen recording, a nested `claude` run, an Xcode
+  build started through the shell, none of which the SDK ever declares as a `task` and so stay invisible
+  once the turn that started them ends. Only descendants alive more than 5 seconds are counted, the CLI
+  process itself is excluded, and the list is capped at 20; `name` is the executable's name only, never
+  the command line. The process-table read (`ps -axo pid=,ppid=,lstart=,comm=`) is cached for 1 second so
+  several snapshots a second cost one read. When the setting is off, `externalProcesses` is absent from
+  the snapshot and nothing about how the CLI is spawned changes.
 
 ## Claude: tasks and subagents
 

@@ -12,6 +12,7 @@
  * - WebSocket message streaming
  */
 
+import { spawn as spawnChildProcess } from 'child_process';
 import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import os from 'os';
@@ -29,6 +30,7 @@ import {
   CLAUDE_ULTRACODE_EFFORT
 } from '@/modules/providers/list/claude/claude-models.provider.js';
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
+import { describeExternalProcesses } from '@/shared/external-process-tree.js';
 import {
   createNotificationEvent,
   notifyBackgroundWorkCompleted,
@@ -37,6 +39,7 @@ import {
   notifyUserIfEnabled
 } from '@/modules/notifications/index.js';
 import { AUTO_BG_WAIT_CEILING_MS, resolveSessionProcessClose } from '@/shared/session-process-close.js';
+import { resolveSessionProcessExternalProcessesEnabled } from '@/shared/session-process-external.js';
 import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.js';
 /**
  * One Claude CLI process per app session.
@@ -340,7 +343,7 @@ function mapCliOptionsToSDK(options = {}) {
  * @returns {SessionProcessSnapshot} Process snapshot
  */
 function describeProcess(proc, state = 'chat') {
-  return {
+  const snapshot = {
     sessionId: proc.key,
     provider: 'claude',
     state,
@@ -349,6 +352,15 @@ function describeProcess(proc, state = 'chat') {
     turnActive: Boolean(proc.turn),
     tasks: Array.from(proc.tasks.values())
   };
+  // Behind SESSION_PROCESS_EXTERNAL_PROCESSES (default off): a screen
+  // recording, a nested `claude` run, a build started through the shell
+  // outlives the turn as a plain OS process, invisible to `tasks` since the
+  // SDK never declared it. `proc.cliPid` is only set when the setting is on
+  // (see `createPidCapturingSpawn`), so this stays a no-op otherwise.
+  if (resolveSessionProcessExternalProcessesEnabled() && proc.cliPid) {
+    snapshot.externalProcesses = describeExternalProcesses(proc.cliPid);
+  }
+  return snapshot;
 }
 
 const ENDED_TASK_STATUSES = new Set(['completed', 'failed', 'stopped']);
@@ -961,6 +973,37 @@ async function applyLiveOptions(proc, turnOptions) {
 }
 
 /**
+ * Captures the pid of the CLI process the SDK spawns for `proc`, so
+ * `describeProcess` can walk its OS descendants (`shared/external-process-tree.js`).
+ *
+ * The SDK's `SpawnedProcess` result never carries a `pid` a caller can read
+ * back, and `query()` keeps its transport private, so `spawnClaudeCodeProcess`
+ * — a public `Options` field since SDK 0.3.x, meant for VM/container spawning
+ * — is the one place the real handle passes through caller code before the
+ * SDK wraps it. This mirrors the SDK's own default local spawn
+ * (`spawnLocalProcess` in the bundle): raw `child_process.spawn`, the same
+ * `stdio` and `windowsHide`, so installing it changes nothing about how the
+ * CLI is spawned, only who also holds the handle.
+ * @param {Object} proc - Session process to record the pid on
+ * @returns {(options: Object) => import('child_process').ChildProcess}
+ */
+function createPidCapturingSpawn(proc) {
+  return function spawnClaudeCodeProcess(options) {
+    const { command, args, cwd, env, signal } = options;
+    const debugStderr = Boolean(env?.DEBUG_CLAUDE_AGENT_SDK);
+    const child = spawnChildProcess(command, args, {
+      cwd,
+      env,
+      signal,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', debugStderr ? 'pipe' : 'ignore']
+    });
+    proc.cliPid = child.pid ?? null;
+    return child;
+  };
+}
+
+/**
  * Starts a session's process and its reader.
  * @param {Object} spec - Key, turn options, persistence, context, identity
  * @returns {Promise<Object>} Session process
@@ -995,6 +1038,10 @@ async function launchSessionProcess(spec) {
     sessionSummary: spec.sessionSummary,
     context: spec.context,
     startedAt: Date.now(),
+    // The pid of the CLI process the SDK spawns, captured through
+    // `spawnClaudeCodeProcess` (see `createPidCapturingSpawn`). Only set
+    // when SESSION_PROCESS_EXTERNAL_PROCESSES is on.
+    cliPid: null,
     // Every task the process ran, by task id (see `recordTask`).
     tasks: new Map(),
     // `tool_use` id -> the agent's tool call it ran under, null on the main
@@ -1009,6 +1056,12 @@ async function launchSessionProcess(spec) {
   };
 
   sdkOptions.abortController = proc.abortController;
+
+  // Only override the SDK's own spawn when the setting that reads its pid is
+  // on: unset, this changes nothing about how or what gets spawned.
+  if (resolveSessionProcessExternalProcessesEnabled()) {
+    sdkOptions.spawnClaudeCodeProcess = createPidCapturingSpawn(proc);
+  }
 
   sdkOptions.hooks = {
     Notification: [{
@@ -1628,5 +1681,7 @@ export {
   getPendingApprovalsForSession,
   extractTokenBudget,
   extractCumulativeTokenBudget,
-  setClaudeQueryImplementation
+  setClaudeQueryImplementation,
+  // Test-only: builds a snapshot from a fabricated process record, without a live SDK query.
+  describeProcess
 };

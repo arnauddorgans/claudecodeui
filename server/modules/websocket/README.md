@@ -164,6 +164,10 @@ flowchart TD
    then ends as a `task` frame with `status: "stopped"`. Protocol errors: `TASK_ID_REQUIRED`,
    `SESSION_NOT_FOUND`, `UNSUPPORTED_PROVIDER`, `NO_PROCESS` (no chat process, or the session is in a
    terminal), `TASK_NOT_FOUND`, `TASK_ENDED`, `STOP_TASK_FAILED`.
+   Behind `SESSION_PROCESS_EXTERNAL_PROCESSES` (default off, see `server/modules/providers/README.md`),
+   the same snapshot also carries `externalProcesses`: OS descendants of the session's CLI process the
+   SDK never declared as a task (a screen recording, a nested `claude` run, a build), so work that
+   outlives the turn as a plain process is not invisible once `tasks` has nothing left running.
 7. **A session lives in one place.** `session_process.state` is `chat` for a process the provider keeps, `terminal` while a `/shell` PTY has the provider's CLI resumed on it (`session-process-registry.service.ts`), `off` once gone. Under `manual` the two exclude each other: opening the terminal on a session closes its chat process, and `chat.send` on a session in a terminal is refused with `SESSION_IN_TERMINAL` until `chat.close` ends the terminal. `chat_subscribed.process` and `GET /api/providers/sessions/running` report the terminal over the chat process.
 
 ## `/shell` Terminal Flow

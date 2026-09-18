@@ -72,7 +72,9 @@
           "server/shared/claude-cli-path.ts",
           "server/shared/image-attachments.ts",
           "server/shared/message-unification.ts",
-          "server/shared/session-process-close.ts"
+          "server/shared/session-process-close.ts",
+          "server/shared/session-process-external.ts",
+          "server/shared/external-process-tree.ts"
         ],
         "mode": "file"
       },

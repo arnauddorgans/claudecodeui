@@ -293,10 +293,26 @@ export type SessionProcessTask = {
 };
 
 /**
+ * One OS descendant of a session's CLI process, still alive past the turn
+ * that spawned it — a screen recording, a nested `claude` run, a build
+ * started through the shell. `name` is the executable's name only, never
+ * the command line, which can hold secrets.
+ */
+export type SessionExternalProcess = {
+  pid: number;
+  name: string;
+  /** Epoch milliseconds. */
+  startedAt: number;
+};
+
+/**
  * A session's process: `chat` while its provider keeps one alive between
  * turns, `terminal` while a `/shell` PTY has the provider's CLI resumed on it,
  * `off` once it has gone. `turnActive` says whether a chat turn is in flight;
  * `tasks` are the tasks the process has run, ended ones included.
+ * `externalProcesses` — the process's OS descendants still running that the
+ * SDK never declared as a task — is present only when
+ * `SESSION_PROCESS_EXTERNAL_PROCESSES` is on (`shared/session-process-external.ts`).
  */
 export type SessionProcessSnapshot = {
   sessionId: string;
@@ -307,6 +323,7 @@ export type SessionProcessSnapshot = {
   providerSessionId: string | null;
   turnActive: boolean;
   tasks: SessionProcessTask[];
+  externalProcesses?: SessionExternalProcess[];
 };
 
 /**
