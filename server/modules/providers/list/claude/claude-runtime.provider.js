@@ -409,7 +409,7 @@ function rememberToolUseParents(proc, sdkMessage) {
  * the gaps in a `task_updated` frame, which only names what changed.
  * @param {Object} proc - Session process
  * @param {Object} msg - Normalized `task` message
- * @returns {{ task: SessionProcessTask, changed: boolean }} The record, and whether the task started or ended
+ * @returns {{ task: SessionProcessTask, changed: boolean }} The record, and whether the task started, ended or came back
  */
 function recordTask(proc, msg) {
   let task = proc.tasks.get(msg.taskId);
@@ -426,10 +426,17 @@ function recordTask(proc, msg) {
   }
 
   const wasEnded = ENDED_TASK_STATUSES.has(task.status);
-  for (const key of ['toolUseId', 'parentToolUseId', 'description', 'taskType', 'agentType', 'summary', 'usage']) {
+  for (const key of ['parentToolUseId', 'description', 'taskType', 'agentType', 'summary', 'usage', 'progress']) {
     if (msg[key] !== undefined) {
       task[key] = msg[key];
     }
+  }
+  // `toolUseId` names the tool call that *created* the task, and is what its
+  // children point at through `parentToolUseId`. A later event can carry
+  // another one — `SendMessage` resuming an agent reports the resumption's
+  // call — so taking it would cut the task loose from its own children.
+  if (task.toolUseId === undefined && msg.toolUseId !== undefined) {
+    task.toolUseId = msg.toolUseId;
   }
   // The event names no parent; the tool call that started the task may (see `rememberToolUseParents`).
   if (task.parentToolUseId === undefined && task.toolUseId) {
@@ -441,16 +448,24 @@ function recordTask(proc, msg) {
   if (typeof msg.background === 'boolean') {
     task.background = msg.background;
   }
-  // An ended task does not come back: a late progress frame is not a restart.
-  if (msg.status && !(wasEnded && !ENDED_TASK_STATUSES.has(msg.status))) {
+  // A task does come back: a backgrounded agent notifies on every result it
+  // hands the main thread, not only on its last, and is then resumed. The
+  // process reads one SDK stream in order (`readProcess`), so a running status
+  // after a terminal one is the task running again, never a straggler — the
+  // status is taken as it comes, and the end it had recorded is dropped.
+  if (msg.status) {
     task.status = msg.status;
   }
-  const ended = !wasEnded && ENDED_TASK_STATUSES.has(task.status);
+  const nowEnded = ENDED_TASK_STATUSES.has(task.status);
+  const ended = !wasEnded && nowEnded;
+  const resumed = wasEnded && !nowEnded;
   if (ended) {
     task.endedAt = Date.now();
+  } else if (resumed) {
+    delete task.endedAt;
   }
 
-  return { task, changed: isNew || ended };
+  return { task, changed: isNew || ended || resumed };
 }
 
 /**

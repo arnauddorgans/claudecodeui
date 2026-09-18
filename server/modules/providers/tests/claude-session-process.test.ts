@@ -446,3 +446,70 @@ test('a task started inside a subagent carries the agent call it ran under', asy
 
   await closeClaudeSDKSession('app-12');
 });
+
+test('a backgrounded agent that reports in again comes back, keeping its name and the call that started it', async () => {
+  const queries = installFakeSdk((query) => {
+    query.onInput = () => {
+      query.emit({ type: 'system', subtype: 'init', session_id: 'sid-13' });
+      query.emit({
+        type: 'system', subtype: 'task_started', task_id: 'task-a', tool_use_id: 'toolu_agent',
+        description: 'Watch the build', subagent_type: 'Explore', task_type: 'subagent', uuid: 'u-1', session_id: 'sid-13',
+      });
+      // It hands a first result to the main thread; the agent itself is not done with.
+      query.emit({
+        type: 'system', subtype: 'task_notification', task_id: 'task-a', tool_use_id: 'toolu_agent',
+        status: 'completed', output_file: '/tmp/a', summary: 'First answer', uuid: 'u-2', session_id: 'sid-13',
+      });
+      query.emit({ type: 'result', subtype: 'success', session_id: 'sid-13' });
+    };
+  });
+  const writer = createWriter();
+  const sessions = new ClaudeSessionsProvider();
+  const context = createContext({ normalizeMessage: (raw, sessionId) => sessions.normalizeMessage(raw, sessionId) });
+  const changes: SessionProcessSnapshot[] = [];
+  const unsubscribe = onSessionProcessChange((snapshot) => changes.push(snapshot));
+
+  await queryClaudeSDK('watch it', { sessionId: 'app-13' }, writer, context);
+
+  const first = (getSessionProcess('app-13')?.tasks ?? [])[0];
+  assert.equal(first.status, 'completed');
+  assert.equal(typeof first.endedAt, 'number');
+  const announced = changes.length;
+
+  // Resumed by `SendMessage`: it runs again, under another tool call, and says what it is busy with.
+  queries[0].emit({
+    type: 'system', subtype: 'task_progress', task_id: 'task-a', tool_use_id: 'toolu_resume',
+    description: 'Running the build', usage: { total_tokens: 30, tool_uses: 2, duration_ms: 900000 },
+    uuid: 'u-3', session_id: 'sid-13',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const back = (getSessionProcess('app-13')?.tasks ?? [])[0];
+  assert.equal(back.status, 'running', 'an ended task comes back');
+  assert.equal(back.endedAt, undefined, 'and the end it had recorded is dropped');
+  assert.equal(back.toolUseId, 'toolu_agent', 'the call that created it, not the one that resumed it');
+  assert.equal(back.description, 'Watch the build', 'its own name, not what it is busy with');
+  assert.equal(back.progress, 'Running the build', 'which rides beside it');
+  assert.equal(changes.length, announced + 1, 'the process is announced again');
+  assert.equal(changes.at(-1)?.tasks[0].status, 'running');
+
+  queries[0].emit({
+    type: 'system', subtype: 'task_notification', task_id: 'task-a', tool_use_id: 'toolu_resume',
+    status: 'completed', output_file: '/tmp/b', summary: 'Second answer', uuid: 'u-4', session_id: 'sid-13',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const ended = (getSessionProcess('app-13')?.tasks ?? [])[0];
+  assert.equal(ended.status, 'completed', 'and ends again');
+  assert.equal(typeof ended.endedAt, 'number');
+  assert.equal(ended.toolUseId, 'toolu_agent');
+  assert.equal(ended.description, 'Watch the build');
+  assert.equal(changes.length, announced + 2);
+
+  const last = writer.frames.filter((frame) => frame.kind === 'task').at(-1);
+  assert.equal(last?.description, 'Watch the build', 'the frame goes out under the task name');
+  assert.equal(last?.summary, 'Second answer');
+
+  await closeClaudeSDKSession('app-13');
+  unsubscribe();
+});

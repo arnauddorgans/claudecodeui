@@ -276,7 +276,14 @@ export type SessionProcessTask = {
   toolUseId?: string;
   /** The tool call of the agent this task ran under, when it ran under one. */
   parentToolUseId?: string;
+  /** The name the task was created with; a provider may rename it, progress never does. */
   description: string;
+  /**
+   * What the task last reported being busy with — for an agent, the child task
+   * it is waiting on. Unlike `description` it changes all the time, and is
+   * absent until the provider reports progress.
+   */
+  progress?: string;
   /** Provider label for the task's kind (`subagent`, `shell`, ...). */
   taskType?: string;
   /** Subagent type, for subagent tasks. */
@@ -419,6 +426,8 @@ export type NormalizedMessage = {
   taskId?: string;
   toolUseId?: string;
   description?: string;
+  /** What the task is busy with right now, when the provider reports progress. */
+  progress?: string;
   taskType?: string;
   agentType?: string;
   background?: boolean;

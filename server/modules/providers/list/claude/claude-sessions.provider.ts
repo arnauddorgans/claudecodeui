@@ -808,13 +808,13 @@ export function normalizeClaudeTaskMessage(raw: AnyRecord, sessionId: string | n
   const fields: Partial<NormalizedMessage> = {
     taskId,
     toolUseId: readOptionalString(raw.tool_use_id),
-    description: readOptionalString(raw.description),
     agentType: readOptionalString(raw.subagent_type),
   };
 
   switch (subtype) {
     case 'task_started':
       fields.status = 'started';
+      fields.description = readOptionalString(raw.description);
       fields.taskType = readOptionalString(raw.task_type);
       fields.background = false;
       break;
@@ -828,6 +828,10 @@ export function normalizeClaudeTaskMessage(raw: AnyRecord, sessionId: string | n
     }
     case 'task_progress':
       fields.status = 'running';
+      // The frame's `description` is what the task is busy with now — for an
+      // agent, the child task it is waiting on — not the task's own name, which
+      // `task_started` gave it. It rides as `progress` so the name survives.
+      fields.progress = readOptionalString(raw.description);
       fields.usage = readTaskUsage(raw.usage);
       fields.summary = readOptionalString(raw.summary);
       break;

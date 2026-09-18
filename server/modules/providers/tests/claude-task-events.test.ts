@@ -83,6 +83,9 @@ test('task_progress is a running task with its usage', () => {
   assert.equal(frame.status, 'running');
   assert.deepEqual(frame.usage, { totalTokens: 1200, toolUses: 3, durationMs: 4500 });
   assert.equal(frame.agentType, 'Explore');
+  // What it is busy with now, not a new name for the task.
+  assert.equal(frame.progress, 'List the files');
+  assert.equal(frame.description, undefined);
 });
 
 test('task_notification ends the task with its outcome and summary', () => {

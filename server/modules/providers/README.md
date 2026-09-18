@@ -435,11 +435,22 @@ patch's `killed` reads `stopped`, `paused` stays `running`); the SDK exposes no
 produce nothing. The `task_notification` kind stays Codex's; Claude's history reader keeps folding
 the transcript's `<task-notification>` rows onto the `Agent` tool card, as before.
 
+A `task_progress` frame's `description` is not the task's name but what it is busy with now — for
+an agent, the child task it is waiting on — so it is normalized as `progress`, a field of its own
+on the `task` message and on the record; `description` is set by `task_started` and by a
+`task_updated` patch that renames the task, and nothing else touches it.
+
 The runtime keeps the process's record of every task it saw (`recordTask`, a `SessionProcessTask`
 per task id, kept after the task ended) and completes each outgoing `task` frame from it, so a
-patch frame still names the task's description, agent type and tool call. The record is
-`SessionProcessSnapshot.tasks`, and the process is announced again (`session_process`) when a task
-starts or ends, never on progress. `runtime.stopTask(sessionId, taskId)` (`IProviderRuntime`,
+patch frame still names the task's description, agent type and tool call. `toolUseId` is only ever
+taken from the first event that carries one: it names the call that *created* the task, which is
+what its children point at, and a later event can name another (`SendMessage` resuming an agent
+reports the resumption's call). The record is `SessionProcessSnapshot.tasks`, and the process is
+announced again (`session_process`) when a task starts, ends, or comes back. A backgrounded agent
+sends a `task_notification` every time it hands a result to the main thread, not only when it dies,
+so an ended task that reports running again is taken at its word: the status is applied as it
+comes and `endedAt` is dropped. The process reads one SDK stream in order, so such a status is
+never a reordered straggler. `runtime.stopTask(sessionId, taskId)` (`IProviderRuntime`,
 optional) calls the SDK's `stopTask` on the session's process; the CLI answers with a
 `task_notification` of status `stopped`, which ends the record like any other. It refuses (false)
 a session without a live process or a task the process never reported.
