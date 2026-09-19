@@ -747,6 +747,9 @@ export function useProjectsState({
         && event.kind !== 'loading_progress'
         && event.kind !== 'session_upserted'
         && event.kind !== 'status'
+        // The model narrating its own tool calls is not news from a session
+        // nobody is looking at: it would light the dot every few calls.
+        && event.kind !== 'tool_use_summary'
         && event.kind !== 'stream_end'
         && event.kind !== 'permission_resolved'
         && event.kind !== 'permission_cancelled'

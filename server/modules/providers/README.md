@@ -359,6 +359,7 @@ Useful tests in this repo:
 - `server/modules/providers/tests/opencode-sessions.test.ts`
 - `server/modules/providers/tests/claude-session-process.test.ts` (the process, its tasks, `stopTask`)
 - `server/modules/providers/tests/claude-task-events.test.ts` (the SDK's task events as `task` messages)
+- `server/modules/providers/tests/claude-activity.test.ts` (what the model says it is doing: summaries, status, thinking estimate)
 
 If you touch sessions or session synchronization, add or update focused tests
 alongside the implementation.
@@ -537,3 +538,87 @@ session has no live process — a task's output is readable while its process li
 reported that task), 409 `TASK_OUTPUT_UNKNOWN` (the task is there but nothing can name its file),
 404 `TASK_OUTPUT_NOT_FOUND` (the file is not there — a task that has written nothing yet), 403
 `TASK_OUTPUT_UNREADABLE` (it will not open, or is not a file). None of them is an empty 200.
+
+## Claude: what the model says it is doing
+
+Between a tool call and the next sentence of prose, a turn used to be silent, and a client had
+nothing to show but a spinner and a word of its own invention. The CLI's spinner verbs are not in
+the stream and never were — they are its own decoration. Three SDK events *are* in the stream, and
+this fork forwards all three.
+
+**The summary — `tool_use_summary`.** The model's own sentence about the tool calls it has just
+made, with the ids of those calls. `normalizeClaudeToolUseSummaryMessage` maps it to a message of
+its own kind:
+
+```json
+{ "kind": "tool_use_summary", "id": "<uuid>", "sessionId": "app-7", "provider": "claude",
+  "timestamp": "2026-09-20T09:14:02.881Z", "seq": 41,
+  "summary": "Read the three config files and found the port",
+  "precedingToolUseIds": ["toolu_1", "toolu_2", "toolu_3"] }
+```
+
+It is a frame rather than a field on the `tool_use` messages it describes, for two reasons: those
+frames went out before it arrived, and one summary names several calls at once. A turn produces
+several of them, and they are **captions, not a rolling status** — each belongs to the calls it
+names. So a client attaches each to those tool cards, and uses only the most recent as the line it
+shows in place of "Working…". A summary with no ids (`precedingToolUseIds: []`) is still a
+summary; a summary with no sentence produces no frame.
+
+**The status — `status` / `text: "activity"`.** The only thing in the stream that tells a
+compaction apart from silence: while the CLI rewrites the context nothing else is emitted, at times
+for a minute. It rides the existing `status` kind, discriminated by `text` the way `token_budget`
+already is, so a client keeps one switch:
+
+```json
+{ "kind": "status", "text": "activity", "activity": "compacting" | "requesting" | null,
+  "compactResult": "success" | "failed", "compactError": "…", "permissionMode": "plan",
+  "id": "<uuid>", "sessionId": "app-7", "provider": "claude", "timestamp": "…", "seq": 42 }
+```
+
+`activity` is `null` when the CLI says it is doing neither, and also when it reports a status this
+fork does not know — an unrecognised status reads as idle, never as itself. `compactResult` and
+`compactError` are present only on the frame that ends a compaction, `permissionMode` only when the
+CLI states one. A change of `activity` is the one thing here worth telling every client about, so
+it re-announces the session's process (`session_process`); a summary or a token estimate does not.
+
+**The thinking estimate — `status` / `text: "thinking_tokens"`.** During redacted thinking the API
+streams only pings, so this running estimate is the sole sign of life:
+
+```json
+{ "kind": "status", "text": "thinking_tokens", "thinkingTokens": 2350,
+  "id": "<uuid>", "sessionId": "app-7", "provider": "claude", "timestamp": "…", "seq": 43 }
+```
+
+Only the running total travels; the SDK's `estimated_tokens_delta` is the increment that produced
+it, and a client that summed deltas would be summing the ones that got through. Because the CLI
+digests one of these per `thinking_delta` — tens a second — the runtime forwards **at most one per
+second** (`CLAUDE_THINKING_TOKENS_INTERVAL_MS`, default `1000`). The first estimate of a thinking
+block always goes out, so the pill appears at once: `estimated_tokens` is the running total *of the
+current block*, so a total no larger than the last one seen is a new block starting. The estimate
+is approximate progress for a pill and is not the bill — `text: "token_budget"` remains the only
+authority on tokens.
+
+**None of the three is live-only by accident.** The CLI writes none of them into its JSONL
+transcript, so nothing can be recovered from history after the fact, and this fork adds no storage
+of its own: a summary's value is *while the turn runs*, and once the turn ends the reply it
+narrated is in the transcript and is the better account. What a client arriving mid-turn needs is
+covered twice over — `chat.subscribe` replays the buffered frames of a running run, and the
+process's record carries the latest of each on `SessionProcessSnapshot.activity`, which
+`chat_subscribed` hands over as `process`:
+
+```json
+"activity": { "status": "compacting", "compactResult": "success", "compactError": "…",
+              "summary": "Ran the tests and they passed",
+              "summaryToolUseIds": ["toolu_2", "toolu_3"], "thinkingTokens": 2350 }
+```
+
+`activity` is turn-scoped: it is cleared when a turn starts and when it ends, so a process sitting
+between turns carries **no `activity` field at all** rather than an object full of nulls, and never
+keeps answering with the last turn's sentence. It holds only the latest of each — the earlier
+summaries are already on the client's timeline as frames. Every estimate updates
+`activity.thinkingTokens`, including the ones the throttle drops, so a client arriving mid-turn
+reads the real number rather than the last one that happened to be sent.
+
+Tested in `server/modules/providers/tests/claude-activity.test.ts`: the three normalizers, a
+summary reaching a subscribed client, a compaction announced going in and coming back out, the
+record cleared at the end of the turn, and the throttle.

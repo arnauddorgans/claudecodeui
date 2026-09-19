@@ -360,6 +360,11 @@ function describeProcess(proc, state = 'chat') {
   if (resolveSessionProcessExternalProcessesEnabled() && proc.cliPid) {
     snapshot.externalProcesses = describeExternalProcesses(proc.cliPid);
   }
+  // Turn-scoped, so between turns there is nothing to say and the field is
+  // absent rather than an object full of nulls.
+  if (proc.activity) {
+    snapshot.activity = { ...proc.activity };
+  }
   return snapshot;
 }
 
@@ -555,6 +560,87 @@ function recordTask(proc, msg) {
   }
 
   return { task, changed: isNew || ended || resumed };
+}
+
+/**
+ * How often at most a thinking-token estimate is forwarded. The CLI digests
+ * one per `thinking_delta`, which is tens a second — a firehose for a number
+ * whose only job is to make a pill move. One a second is already more than a
+ * client redraws.
+ */
+const THINKING_TOKENS_INTERVAL_MS = parseInt(process.env.CLAUDE_THINKING_TOKENS_INTERVAL_MS, 10) || 1000;
+
+/**
+ * Whether this thinking-token estimate is the one that goes out.
+ *
+ * The first of a block always passes, so the pill appears at once rather than
+ * a second late: `estimated_tokens` is the running total *of the current
+ * block*, so a total no larger than the last one seen is a new block starting.
+ * @param {Object} proc - Session process
+ * @param {number} estimated - The running estimate the frame carries
+ * @returns {boolean} True when the frame should reach the client
+ */
+function allowThinkingTokens(proc, estimated) {
+  const previous = proc.activity?.thinkingTokens;
+  const restarted = typeof previous !== 'number' || estimated <= previous;
+  if (restarted || Date.now() - proc.thinkingTokensSentAt >= THINKING_TOKENS_INTERVAL_MS) {
+    proc.thinkingTokensSentAt = Date.now();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Keeps the process's record of what the model is doing up to date from one
+ * normalized live frame, and says whether the change is one every client
+ * should hear about.
+ *
+ * The record is what `chat_subscribed` hands a client that arrives mid-turn:
+ * the frames themselves are replayed only while a run is registered, and none
+ * of these three is ever written to the CLI's transcript, so without it a
+ * client joining a long compaction sees the same silence as before.
+ *
+ * Only `compacting`/`requesting` is worth a `session_process` broadcast — it
+ * says where the session stands, which is that event's job. A summary or a
+ * token estimate reaches the session's own clients on the run stream, and
+ * broadcasting either to everyone once a second would be noise.
+ * @param {Object} proc - Session process
+ * @param {Object} msg - Normalized `status` or `tool_use_summary` message
+ * @returns {boolean} True when the activity status itself changed
+ */
+function recordActivity(proc, msg) {
+  const activity = proc.activity ?? { status: null };
+  proc.activity = activity;
+
+  if (msg.kind === 'tool_use_summary') {
+    activity.summary = msg.summary;
+    activity.summaryToolUseIds = msg.precedingToolUseIds ?? [];
+    return false;
+  }
+  if (msg.text === 'thinking_tokens') {
+    activity.thinkingTokens = msg.thinkingTokens;
+    return false;
+  }
+
+  const previous = activity.status;
+  activity.status = msg.activity ?? null;
+  if (msg.compactResult !== undefined) {
+    activity.compactResult = msg.compactResult;
+  }
+  if (msg.compactError !== undefined) {
+    activity.compactError = msg.compactError;
+  }
+  return activity.status !== previous;
+}
+
+/**
+ * Drops the process's activity record: the turn it described is over, and the
+ * next one starts from silence rather than from the last turn's sentence.
+ * @param {Object} proc - Session process
+ */
+function clearActivity(proc) {
+  proc.activity = null;
+  proc.thinkingTokensSentAt = 0;
 }
 
 /**
@@ -1184,6 +1270,11 @@ async function launchSessionProcess(spec) {
     // Task id -> the output file the CLI announced at launch, for tasks whose
     // record does not exist yet (see `rememberTaskOutputFiles`).
     taskOutputFiles: new Map(),
+    // What the model says it is doing inside the turn in flight, or null
+    // between turns (see `recordActivity`).
+    activity: null,
+    // When the last thinking-token estimate was forwarded (see `allowThinkingTokens`).
+    thinkingTokensSentAt: 0,
     turn: null,
     closing: false,
     exited: null,
@@ -1398,6 +1489,7 @@ async function runTurn(proc, promptMessages, ws, sessionSummary) {
   let finish;
   const done = new Promise((resolve) => { finish = resolve; });
   proc.turn = { done, finish, aborted: false, completeSent: false, assistantBudgetSent: false, backgroundWork: false };
+  clearActivity(proc);
 
   console.log('Turn started for session:', proc.key || proc.providerSessionId || 'NEW');
   for (const message of promptMessages) {
@@ -1459,7 +1551,7 @@ function handleProcessMessage(proc, message) {
   // Transform and normalize message via adapter
   const transformedMessage = transformMessage(message);
   const normalized = proc.context.normalizeMessage(transformedMessage, sid);
-  let tasksChanged = false;
+  let processChanged = false;
   for (const msg of normalized) {
     // Preserve parentToolUseId from SDK wrapper for subagent tool grouping
     if (transformedMessage.parentToolUseId && !msg.parentToolUseId) {
@@ -1472,11 +1564,22 @@ function handleProcessMessage(proc, message) {
       // The frame goes out whole: what this event left unsaid, the record knows.
       const { task, changed } = recordTask(proc, msg);
       Object.assign(msg, task);
-      tasksChanged = tasksChanged || changed;
+      processChanged = processChanged || changed;
+    }
+    // Every estimate updates the record, so a client arriving mid-turn reads
+    // the real one; only one a second goes out as a frame.
+    const throttled = msg.kind === 'status'
+      && msg.text === 'thinking_tokens'
+      && !allowThinkingTokens(proc, msg.thinkingTokens);
+    if (msg.kind === 'tool_use_summary' || (msg.kind === 'status' && msg.text !== 'token_budget')) {
+      processChanged = recordActivity(proc, msg) || processChanged;
+    }
+    if (throttled) {
+      continue;
     }
     writer?.send(msg);
   }
-  if (tasksChanged) {
+  if (processChanged) {
     emitProcessChange(proc, 'chat');
   }
 
@@ -1569,6 +1672,9 @@ function clearHold(proc) {
 function endTurn(proc, turn, outcome) {
   if (proc.turn === turn) {
     proc.turn = null;
+    // What the model was doing was this turn's; the process between turns is
+    // doing nothing, and must not keep answering with the last sentence.
+    clearActivity(proc);
   }
   if (turn.completeSent) {
     turn.finish();

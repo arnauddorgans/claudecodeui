@@ -191,7 +191,8 @@ export type MessageKind =
   | 'session_created'
   | 'history_truncated'
   | 'task_notification'
-  | 'task';
+  | 'task'
+  | 'tool_use_summary';
 
 /**
  * Event kinds added by the chat gateway layer on top of provider message kinds.
@@ -368,6 +369,38 @@ export type SessionExternalProcess = {
 };
 
 /**
+ * What the model is doing inside the turn in flight, as the CLI reports it,
+ * so a client can say it instead of showing a spinner word.
+ *
+ * Every field is turn-scoped: the record is cleared when the turn ends, and a
+ * process between turns carries no activity at all. Each field is also the
+ * *latest* the process heard — the earlier ones already went out as frames and
+ * are on the client's timeline.
+ */
+export type SessionProcessActivity = {
+  /**
+   * `compacting` while the CLI rewrites the context — which can last, and
+   * without this looks exactly like silence — `requesting` while it waits on
+   * the API, `null` once the CLI says it is doing neither.
+   */
+  status: 'compacting' | 'requesting' | null;
+  /** How the last compaction ended, from the frame that ended it. */
+  compactResult?: 'success' | 'failed';
+  /** Why the last compaction failed, when it did. */
+  compactError?: string;
+  /** The model's own last sentence about the tool calls it had just made. */
+  summary?: string;
+  /** The tool calls that sentence is about, as the CLI named them. */
+  summaryToolUseIds?: string[];
+  /**
+   * Running estimate of the thinking tokens of the block in flight. Approximate
+   * progress for a pill, never the billed output tokens — `token_budget` is
+   * where the bill lives.
+   */
+  thinkingTokens?: number;
+};
+
+/**
  * A session's process: `chat` while its provider keeps one alive between
  * turns, `terminal` while a `/shell` PTY has the provider's CLI resumed on it,
  * `off` once it has gone. `turnActive` says whether a chat turn is in flight;
@@ -386,6 +419,12 @@ export type SessionProcessSnapshot = {
   turnActive: boolean;
   tasks: SessionProcessTask[];
   externalProcesses?: SessionExternalProcess[];
+  /**
+   * What the model is doing right now, present only while a turn is reporting
+   * something (Claude only today). A client arriving mid-turn reads it from
+   * `chat_subscribed.process` instead of waiting for the next frame.
+   */
+  activity?: SessionProcessActivity;
 };
 
 /**
@@ -489,6 +528,28 @@ export type NormalizedMessage = {
   usage?: SessionTaskUsage;
   /** `task` messages: the file the task's output was written to, when the provider names it. */
   outputFile?: string;
+  /**
+   * `tool_use_summary` messages: the tool calls the sentence in `summary` is
+   * about. It is a caption for those calls, not a rolling status — several
+   * arrive in one turn, each naming its own calls.
+   */
+  precedingToolUseIds?: string[];
+  /**
+   * `status` messages with `text: 'activity'`: what the model is doing, from
+   * the CLI's own status frame. `null` when it says it is doing neither.
+   */
+  activity?: 'compacting' | 'requesting' | null;
+  /** `status` messages with `text: 'activity'`: how a compaction that just ended went. */
+  compactResult?: 'success' | 'failed';
+  compactError?: string;
+  /** `status` messages with `text: 'activity'`: the permission mode the CLI reports with the status. */
+  permissionMode?: string;
+  /**
+   * `status` messages with `text: 'thinking_tokens'`: the running estimate for
+   * the thinking block in flight. Approximate, for a pill; the bill is on the
+   * `token_budget` status.
+   */
+  thinkingTokens?: number;
   /** Set on everything a subagent emits: the tool call that spawned it. */
   parentToolUseId?: string;
   /**

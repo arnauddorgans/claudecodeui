@@ -507,7 +507,8 @@ type MessageKind =
   | 'permission_cancelled'
   | 'session_created'
   | 'history_truncated'
-  | 'task_notification';
+  | 'task_notification'
+  | 'tool_use_summary';
 
 // ---------------------------
 

@@ -864,6 +864,101 @@ export function normalizeClaudeTaskMessage(raw: AnyRecord, sessionId: string | n
   });
 }
 
+/** What `SDKStatus` can say. Anything else — including the CLI's `null` — reads as idle. */
+const CLAUDE_ACTIVITY_STATUSES = new Set(['compacting', 'requesting']);
+
+/**
+ * One `system`/`status` event as an `activity` status message.
+ *
+ * `SDKStatusMessage` is the only thing in the stream that tells a compaction
+ * apart from silence: while the CLI rewrites the context nothing else is
+ * emitted, sometimes for a minute. The status rides the existing `status`
+ * kind, discriminated by `text` the way `token_budget` already is, so a client
+ * keeps one switch.
+ */
+export function normalizeClaudeStatusMessage(raw: AnyRecord, sessionId: string | null): NormalizedMessage | null {
+  if (raw.type !== 'system' || raw.subtype !== 'status') {
+    return null;
+  }
+  const status = typeof raw.status === 'string' && CLAUDE_ACTIVITY_STATUSES.has(raw.status)
+    ? raw.status as 'compacting' | 'requesting'
+    : null;
+  const fields: Partial<NormalizedMessage> = {
+    compactResult: raw.compact_result === 'success' || raw.compact_result === 'failed' ? raw.compact_result : undefined,
+    compactError: readOptionalString(raw.compact_error),
+    permissionMode: readOptionalString(raw.permissionMode),
+  };
+  for (const key of Object.keys(fields) as Array<keyof typeof fields>) {
+    if (fields[key] === undefined) {
+      delete fields[key];
+    }
+  }
+  return createNormalizedMessage({
+    ...fields,
+    id: readOptionalString(raw.uuid),
+    kind: 'status',
+    text: 'activity',
+    activity: status,
+    sessionId,
+    provider: PROVIDER,
+  });
+}
+
+/**
+ * One `system`/`thinking_tokens` event as a `thinking_tokens` status message.
+ *
+ * Only the running total travels. The per-frame delta is the increment that
+ * produced it, and the runtime throttles these frames anyway, so a client
+ * adding the deltas up would only be adding up the ones that got through.
+ */
+export function normalizeClaudeThinkingTokensMessage(raw: AnyRecord, sessionId: string | null): NormalizedMessage | null {
+  if (raw.type !== 'system' || raw.subtype !== 'thinking_tokens') {
+    return null;
+  }
+  const estimated = Number(raw.estimated_tokens);
+  if (!Number.isFinite(estimated) || estimated < 0) {
+    return null;
+  }
+  return createNormalizedMessage({
+    id: readOptionalString(raw.uuid),
+    kind: 'status',
+    text: 'thinking_tokens',
+    thinkingTokens: Math.round(estimated),
+    sessionId,
+    provider: PROVIDER,
+  });
+}
+
+/**
+ * One `tool_use_summary` event as a message of its own.
+ *
+ * It is the model's own sentence about the tool calls it has just made — what
+ * a client shows in place of "Working…". It cannot ride on the `tool_use`
+ * frames it describes: those went out before it arrived, and it names several
+ * of them at once. So it is a frame, carrying the ids of the calls it
+ * captions.
+ */
+export function normalizeClaudeToolUseSummaryMessage(raw: AnyRecord, sessionId: string | null): NormalizedMessage | null {
+  if (raw.type !== 'tool_use_summary') {
+    return null;
+  }
+  const summary = readOptionalString(raw.summary);
+  if (!summary) {
+    return null;
+  }
+  const precedingToolUseIds = Array.isArray(raw.preceding_tool_use_ids)
+    ? raw.preceding_tool_use_ids.filter((value: unknown): value is string => typeof value === 'string' && value.length > 0)
+    : [];
+  return createNormalizedMessage({
+    id: readOptionalString(raw.uuid),
+    kind: 'tool_use_summary',
+    summary,
+    precedingToolUseIds,
+    sessionId,
+    provider: PROVIDER,
+  });
+}
+
 function stripAnsiFormatting(text: string): string {
   return text.replace(/\u001B\[[0-9;?]*[ -/]*[@-~]/g, '');
 }
@@ -908,9 +1003,15 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     if (raw.type === 'content_block_stop') {
       return [createNormalizedMessage({ kind: 'stream_end', sessionId, provider: PROVIDER })];
     }
+    if (raw.type === 'tool_use_summary') {
+      const summary = normalizeClaudeToolUseSummaryMessage(raw, sessionId);
+      return summary ? [summary] : [];
+    }
     if (raw.type === 'system') {
-      const task = normalizeClaudeTaskMessage(raw, sessionId);
-      return task ? [task] : [];
+      const live = normalizeClaudeTaskMessage(raw, sessionId)
+        ?? normalizeClaudeStatusMessage(raw, sessionId)
+        ?? normalizeClaudeThinkingTokensMessage(raw, sessionId);
+      return live ? [live] : [];
     }
 
     const messages: NormalizedMessage[] = [];
