@@ -419,9 +419,15 @@ busy with that work: two processes resumed the same transcript and both appended
   build started through the shell, none of which the SDK ever declares as a `task` and so stay invisible
   once the turn that started them ends. Only descendants alive more than 5 seconds are counted, the CLI
   process itself is excluded, and the list is capped at 20; `name` is the executable's name only, never
-  the command line. The process-table read (`ps -axo pid=,ppid=,lstart=,comm=`) is cached for 1 second so
-  several snapshots a second cost one read. When the setting is off, `externalProcesses` is absent from
-  the snapshot and nothing about how the CLI is spawned changes.
+  the command line. The session's own infrastructure is dropped with its subtree: MCP servers and
+  language servers stay in the CLI's process group, while the CLI starts each `Bash` tool call detached,
+  as its own group leader, so a descendant whose `pgid` is the CLI's own is the session running itself
+  and one that leads its own group is the turn's work, everything below it included. The group is read
+  off the CLI's own row, so the rule holds whether or not the CLI was itself spawned detached; if that
+  row is missing (a `ps` read racing session shutdown) nothing is pruned, since listing too much beats
+  reporting an idle session. The process-table read (`ps -axo pid=,ppid=,pgid=,lstart=,comm=`) is cached
+  for 1 second so several snapshots a second cost one read. When the setting is off, `externalProcesses`
+  is absent from the snapshot and nothing about how the CLI is spawned changes.
 
 ## Claude: tasks and subagents
 
