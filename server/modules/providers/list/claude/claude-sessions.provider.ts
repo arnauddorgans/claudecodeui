@@ -839,6 +839,10 @@ export function normalizeClaudeTaskMessage(raw: AnyRecord, sessionId: string | n
       fields.status = raw.status === 'failed' || raw.status === 'stopped' ? raw.status : 'completed';
       fields.usage = readTaskUsage(raw.usage);
       fields.summary = readOptionalString(raw.summary);
+      // The only event that names the file the task wrote to. The runtime
+      // keeps it on the task's record, which is what the output read route
+      // resolves a task id against.
+      fields.outputFile = readOptionalString(raw.output_file);
       break;
     default:
       return null;

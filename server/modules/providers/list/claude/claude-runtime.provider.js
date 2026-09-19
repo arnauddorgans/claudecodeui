@@ -402,6 +402,88 @@ function rememberToolUseParents(proc, sdkMessage) {
   }
 }
 
+/** How many output files a process remembers for tasks it has not seen an event for yet. */
+const TASK_OUTPUT_FILES_LIMIT = 500;
+
+/** The task ids a path may be built from: an id, nothing else. */
+const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * How long an encoded working directory the CLI writes before it truncates it
+ * and appends a hash of its own (200 characters in its bundle). Past that the
+ * path cannot be worked out, only read from what the CLI announces.
+ */
+const CLAUDE_TMP_SLUG_LIMIT = 200;
+
+/**
+ * Where the CLI writes a task's output, worked out from the process the task
+ * belongs to:
+ * `<CLAUDE_CODE_TMPDIR or /tmp>/claude-<uid>/<encoded cwd>/<provider session id>/tasks/<task id>.output`.
+ *
+ * The SDK only names that file in `task_notification`, which arrives when the
+ * task ends; this is what makes a *running* task's output readable. It is a
+ * guess by construction — the route serves it only if the file is there — and
+ * it is never a path a caller supplied: the task id is checked against
+ * `TASK_ID_PATTERN` and everything else comes from the process's own record.
+ * @param {Object} proc - Session process
+ * @param {string} taskId - Task id
+ * @returns {string|null} Absolute path, or null when it cannot be worked out
+ */
+function deriveTaskOutputFile(proc, taskId) {
+  if (!proc.cwd || !proc.providerSessionId || !TASK_ID_PATTERN.test(taskId)) {
+    return null;
+  }
+  const encodedCwd = proc.cwd.replace(/[^a-zA-Z0-9]/g, '-');
+  if (encodedCwd.length > CLAUDE_TMP_SLUG_LIMIT) {
+    return null;
+  }
+  const base = process.env.CLAUDE_CODE_TMPDIR || '/tmp';
+  return path.join(
+    base,
+    `claude-${process.getuid?.() ?? 0}`,
+    encodedCwd,
+    proc.providerSessionId,
+    'tasks',
+    `${taskId}.output`
+  );
+}
+
+/**
+ * Remembers the output file the CLI names when it launches an agent
+ * asynchronously: that tool result carries `{ isAsync, agentId, outputFile }`,
+ * and `agentId` is the id the task events use. It is the only announcement of
+ * a task's file that arrives while the task is still running, so it is kept
+ * even when no task event has created the record yet — bounded to the last
+ * TASK_OUTPUT_FILES_LIMIT ids, in stream order.
+ * @param {Object} proc - Session process
+ * @param {Object} sdkMessage - SDK stream message
+ */
+function rememberTaskOutputFiles(proc, sdkMessage) {
+  if (sdkMessage?.type !== 'user') {
+    return;
+  }
+  const result = sdkMessage.tool_use_result ?? sdkMessage.toolUseResult;
+  if (!result || typeof result !== 'object') {
+    return;
+  }
+  const taskId = typeof result.agentId === 'string' ? result.agentId : null;
+  const outputFile = typeof result.outputFile === 'string' ? result.outputFile : null;
+  if (!taskId || !outputFile) {
+    return;
+  }
+  const task = proc.tasks.get(taskId);
+  if (task) {
+    task.outputFile = outputFile;
+    return;
+  }
+  // Re-insert so a repeated id stays among the newest.
+  proc.taskOutputFiles.delete(taskId);
+  proc.taskOutputFiles.set(taskId, outputFile);
+  if (proc.taskOutputFiles.size > TASK_OUTPUT_FILES_LIMIT) {
+    proc.taskOutputFiles.delete(proc.taskOutputFiles.keys().next().value);
+  }
+}
+
 /**
  * Keeps the process's record of a task up to date from one of the SDK's task
  * events, already normalized into a `task` message. The record outlives the
@@ -426,7 +508,7 @@ function recordTask(proc, msg) {
   }
 
   const wasEnded = ENDED_TASK_STATUSES.has(task.status);
-  for (const key of ['parentToolUseId', 'description', 'taskType', 'agentType', 'summary', 'usage', 'progress']) {
+  for (const key of ['parentToolUseId', 'description', 'taskType', 'agentType', 'summary', 'usage', 'progress', 'outputFile']) {
     if (msg[key] !== undefined) {
       task[key] = msg[key];
     }
@@ -437,6 +519,13 @@ function recordTask(proc, msg) {
   // call — so taking it would cut the task loose from its own children.
   if (task.toolUseId === undefined && msg.toolUseId !== undefined) {
     task.toolUseId = msg.toolUseId;
+  }
+  // The event names no file; the launch of an asynchronous agent did (see `rememberTaskOutputFiles`).
+  if (task.outputFile === undefined) {
+    const announced = proc.taskOutputFiles.get(msg.taskId);
+    if (announced) {
+      task.outputFile = announced;
+    }
   }
   // The event names no parent; the tool call that started the task may (see `rememberToolUseParents`).
   if (task.parentToolUseId === undefined && task.toolUseId) {
@@ -466,6 +555,36 @@ function recordTask(proc, msg) {
   }
 
   return { task, changed: isNew || ended || resumed };
+}
+
+/**
+ * Where one task of a session's process writes its output, and whether it is
+ * still running — what the output read route resolves a task id against, so
+ * no caller ever names a path. Null when the session has no live process or
+ * the task is not one of its; `outputFile` is null when neither the CLI nor
+ * the process can name the file.
+ * @param {string} sessionId - App session id
+ * @param {string} taskId - Task id, as reported on the `task` frames
+ * @returns {SessionTaskOutputTarget|null} What the record knows about the task's output
+ */
+function describeSessionTask(sessionId, taskId) {
+  const proc = sessionProcesses.get(sessionId);
+  if (!proc || !proc.persistent || proc.closing) {
+    return null;
+  }
+  const task = proc.tasks.get(taskId);
+  if (!task) {
+    return null;
+  }
+  const announced = typeof task.outputFile === 'string' && task.outputFile ? task.outputFile : null;
+  const derived = announced ? null : deriveTaskOutputFile(proc, taskId);
+  return {
+    taskId: task.taskId,
+    status: task.status,
+    running: !ENDED_TASK_STATUSES.has(task.status),
+    outputFile: announced ?? derived,
+    outputFileSource: (announced && 'announced') || (derived && 'derived') || null,
+  };
 }
 
 /**
@@ -1062,6 +1181,9 @@ async function launchSessionProcess(spec) {
     // `tool_use` id -> the agent's tool call it ran under, null on the main
     // thread (see `rememberToolUseParents`).
     toolUseParents: new Map(),
+    // Task id -> the output file the CLI announced at launch, for tasks whose
+    // record does not exist yet (see `rememberTaskOutputFiles`).
+    taskOutputFiles: new Map(),
     turn: null,
     closing: false,
     exited: null,
@@ -1332,6 +1454,7 @@ function handleProcessMessage(proc, message) {
   const sid = eventSessionIdOf(proc);
 
   rememberToolUseParents(proc, message);
+  rememberTaskOutputFiles(proc, message);
 
   // Transform and normalize message via adapter
   const transformedMessage = transformMessage(message);
@@ -1670,6 +1793,7 @@ export const claudeRuntime = {
   abort: abortClaudeSDKSession,
   close: closeClaudeSDKSession,
   stopTask: stopClaudeSDKTask,
+  describeTask: describeSessionTask,
   processes: {
     get: getSessionProcess,
     list: listSessionProcesses,
@@ -1689,6 +1813,7 @@ export {
   closeClaudeSDKSession,
   closeAllClaudeSDKSessions,
   stopClaudeSDKTask,
+  describeSessionTask,
   getSessionProcess,
   listSessionProcesses,
   onSessionProcessChange,

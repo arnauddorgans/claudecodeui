@@ -96,6 +96,7 @@ test('task_notification ends the task with its outcome and summary', () => {
   assert.equal(completed.status, 'completed');
   assert.equal(completed.summary, 'Three files found');
   assert.deepEqual(completed.usage, { totalTokens: 2000, toolUses: 4, durationMs: 9000 });
+  assert.equal(completed.outputFile, '/tmp/out', 'the one event that names where the task wrote');
 
   const [failed] = normalize({ ...base, status: 'failed', summary: 'boom', uuid: 'u-failed' });
   assert.equal(failed.status, 'failed');

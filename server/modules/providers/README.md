@@ -482,3 +482,58 @@ the app session id. `agentId` must match `[A-Za-z0-9_-]{1,64}`; an unknown one i
 `AGENT_NOT_FOUND`. Only the `<session>/subagents/` layout is listed: older CLIs dropped agent files
 next to the parent with nothing tying them to a session, though `fetchAgentHistory` still finds
 them by id.
+
+## Claude: reading what a task is writing
+
+A task's summary says how it went; the file it wrote says what it did. `GET
+/api/providers/sessions/:sessionId/tasks/:taskId/output` serves a window of that file, addressed by
+byte offset, so a client can poll forward while the task works and stop when it ends. It is a plain
+read: no frame, no push, nothing to re-subscribe to after a reconnection — an offset is all a mobile
+client has to remember.
+
+```
+GET /api/providers/sessions/app-7/tasks/b7k2m1x/output?offset=0&limit=65536
+{ "data": { "sessionId": "app-7", "taskId": "b7k2m1x", "status": "running", "running": true,
+            "outputFileSource": "derived", "encoding": "text", "content": "compiling…\n",
+            "offset": 0, "nextOffset": 11, "bytesRead": 11, "size": 11, "truncated": false } }
+```
+
+- `offset` (bytes, default 0) or `tail` (the last N bytes, up to 1 MiB) — never both, which is a 400
+  `INVALID_QUERY_PARAMETER`. A build log's interesting part is its end, and `tail` is how to open on
+  it without walking the file.
+- `limit` caps one answer: 64 KiB by default, 1 MiB at most, 1 KiB at least. Past the cap the answer
+  is cut and `truncated: true` says so, with `nextOffset` naming where to carry on — a 40 MB
+  `xcodebuild` log comes back in as many calls as the client cares to make, and never in one.
+- `encoding` is `text` (default) or `base64`. A byte offset lands anywhere, including inside a
+  multi-byte character: a `text` answer opens on the next whole character and stops before an
+  unfinished one, and reports the `offset` and `nextOffset` it actually used, so nothing is ever cut
+  in half and nothing is lost. `base64` hands back the window's bytes exactly as they are.
+- `running` is false once the task completed, failed or was stopped: the client polls until it is
+  false and `nextOffset === size`, then stops. `nextOffset` past a file that shrank comes back
+  clamped to its size rather than an offset that can never be reached.
+
+**The route never opens a path a caller supplied.** The file is resolved from the task's own record
+on the session's process (`IProviderRuntime.describeTask`, Claude only today), by session id and task
+id; `taskId` must match `[A-Za-z0-9_-]{1,64}`, and no parameter of this route names a file. The
+record learns the path from three places, in this order:
+
+- `task_notification.output_file` — the SDK's only announcement of it, and it arrives when the task
+  *ends*. `normalizeClaudeTaskMessage` keeps it, `recordTask` stores it on the record
+  (`SessionProcessTask.outputFile`, `outputFileSource: "announced"`).
+- the tool result of an asynchronous agent's launch (`{ isAsync, agentId, outputFile }`), which names
+  the file while the agent is still running. `rememberTaskOutputFiles` keeps it per process (the last
+  500 ids), including for a task whose record does not exist yet.
+- failing both, the path the CLI itself builds:
+  `<CLAUDE_CODE_TMPDIR or /tmp>/claude-<uid>/<cwd with every non-alphanumeric character replaced by
+  `-`>/<provider session id>/tasks/<task id>.output` (`outputFileSource: "derived"`). This is what
+  makes a backgrounded `Bash` — the build whose log is the whole point — readable *while it runs*,
+  since nothing announces its file before it ends. It is a construction, not a promise: the route
+  serves it only if the file is there, and gives up on a working directory whose encoded form passes
+  200 characters, where the CLI appends a hash of its own.
+
+Each way of having nothing to serve is its own answer: 409 `SESSION_PROCESS_NOT_RUNNING` (the
+session has no live process — a task's output is readable while its process lives, which under
+`SESSION_PROCESS_CLOSE=manual` is until someone closes it), 404 `TASK_NOT_FOUND` (the process never
+reported that task), 409 `TASK_OUTPUT_UNKNOWN` (the task is there but nothing can name its file),
+404 `TASK_OUTPUT_NOT_FOUND` (the file is not there — a task that has written nothing yet), 403
+`TASK_OUTPUT_UNREADABLE` (it will not open, or is not a file). None of them is an empty 200.

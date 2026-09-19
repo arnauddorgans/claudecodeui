@@ -7,6 +7,11 @@ import { providerModelsService } from '@/modules/providers/services/provider-mod
 import { providerTokenUsageService } from '@/modules/providers/services/provider-token-usage.service.js';
 import { providerSkillsService } from '@/modules/providers/services/skills.service.js';
 import { sessionConversationsSearchService } from '@/modules/providers/services/session-conversations-search.service.js';
+import {
+  TASK_OUTPUT_MAX_LIMIT,
+  TASK_OUTPUT_MIN_LIMIT,
+  sessionTaskOutputService,
+} from '@/modules/providers/services/session-task-output.service.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import type {
   CustomProviderModelInput,
@@ -15,6 +20,7 @@ import type {
   McpTransport,
   ProviderSkillCreateFile,
   ProviderSkillCreateInput,
+  SessionTaskOutputEncoding,
   UpsertProviderMcpServerInput,
 } from '@/shared/types.js';
 import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/utils.js';
@@ -66,6 +72,36 @@ const parseAgentId = (value: unknown): string => {
   }
 
   return agentId;
+};
+
+// A task id as the SDK reports it, and the only caller-supplied part of the
+// path a task's output is read from.
+const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+const parseTaskId = (value: unknown): string => {
+  const taskId = readPathParam(value, 'taskId').trim();
+  if (!TASK_ID_PATTERN.test(taskId)) {
+    throw new AppError('Invalid taskId.', {
+      code: 'INVALID_TASK_ID',
+      statusCode: 400,
+    });
+  }
+
+  return taskId;
+};
+
+const parseTaskOutputEncoding = (value: unknown): SessionTaskOutputEncoding | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === 'text' || value === 'base64') {
+    return value;
+  }
+
+  throw new AppError('encoding must be "text" or "base64".', {
+    code: 'INVALID_QUERY_PARAMETER',
+    statusCode: 400,
+  });
 };
 
 const readOptionalQueryString = (value: unknown): string | undefined => {
@@ -885,6 +921,44 @@ router.get(
     const result = await sessionsService.fetchAgentHistory(sessionId, agentId, {
       limit,
       offset,
+    });
+    res.json(createApiSuccessResponse(result));
+  }),
+);
+
+/**
+ * A window of one task's output file, addressed by byte offset so a client can
+ * poll forward while the task works (`nextOffset`, `running`) and stop once it
+ * has ended. `tail` reads the last N bytes instead, for a log whose
+ * interesting part is its end. The file is resolved from the task's own record
+ * on the session's process; no parameter of this route names a path.
+ */
+router.get(
+  '/sessions/:sessionId/tasks/:taskId/output',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const taskId = parseTaskId(req.params.taskId);
+    const offset = parseBoundedIntegerQuery(req.query.offset, 'offset', null, 0);
+    const tail = parseBoundedIntegerQuery(req.query.tail, 'tail', null, 0, TASK_OUTPUT_MAX_LIMIT);
+    const limit = parseBoundedIntegerQuery(
+      req.query.limit,
+      'limit',
+      null,
+      TASK_OUTPUT_MIN_LIMIT,
+      TASK_OUTPUT_MAX_LIMIT,
+    );
+    if (offset !== null && tail !== null) {
+      throw new AppError('offset and tail cannot be combined.', {
+        code: 'INVALID_QUERY_PARAMETER',
+        statusCode: 400,
+      });
+    }
+
+    const result = await sessionTaskOutputService.readTaskOutput(sessionId, taskId, {
+      offset: offset ?? undefined,
+      tail: tail ?? undefined,
+      limit: limit ?? undefined,
+      encoding: parseTaskOutputEncoding(req.query.encoding),
     });
     res.json(createApiSuccessResponse(result));
   }),

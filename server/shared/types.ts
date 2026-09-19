@@ -297,6 +297,61 @@ export type SessionProcessTask = {
   /** The provider's closing note, once the task ended. */
   summary?: string;
   usage?: SessionTaskUsage;
+  /**
+   * The file the task's output is written to, as the provider announced it.
+   * Absent until it does; the record keeps it so the task's output can be
+   * read back by task id rather than by a path a caller supplies.
+   */
+  outputFile?: string;
+};
+
+/**
+ * Where the path of a task's output file comes from: `announced` when the
+ * provider named it, `derived` when the runtime worked it out from the
+ * process it belongs to.
+ */
+export type SessionTaskOutputSource = 'announced' | 'derived';
+
+/**
+ * What a session's process knows about where one of its tasks writes. This is
+ * the only place a task's output path is allowed to come from: the read route
+ * takes a session id and a task id, never a path.
+ */
+export type SessionTaskOutputTarget = {
+  taskId: string;
+  status: SessionTaskStatus;
+  /** False once the task completed, failed or was stopped. */
+  running: boolean;
+  /** Null when neither the provider nor the process can name the file. */
+  outputFile: string | null;
+  outputFileSource: SessionTaskOutputSource | null;
+};
+
+/** How a chunk of a task's output is encoded in the response. */
+export type SessionTaskOutputEncoding = 'text' | 'base64';
+
+/**
+ * One window of a task's output file, addressed by byte offset so a client can
+ * poll forward while the task works and stop once it has ended.
+ */
+export type SessionTaskOutputChunk = {
+  sessionId: string;
+  taskId: string;
+  status: SessionTaskStatus;
+  /** False once the task ended: no more will be written past `size`. */
+  running: boolean;
+  outputFileSource: SessionTaskOutputSource;
+  encoding: SessionTaskOutputEncoding;
+  content: string;
+  /** Byte offset the chunk starts at, after any adjustment the server made. */
+  offset: number;
+  /** Byte offset to ask for next: `offset + bytesRead`. */
+  nextOffset: number;
+  bytesRead: number;
+  /** Size of the file when it was read. */
+  size: number;
+  /** True when the cap cut the read short: more is already available now. */
+  truncated: boolean;
 };
 
 /**
@@ -432,6 +487,8 @@ export type NormalizedMessage = {
   agentType?: string;
   background?: boolean;
   usage?: SessionTaskUsage;
+  /** `task` messages: the file the task's output was written to, when the provider names it. */
+  outputFile?: string;
   /** Set on everything a subagent emits: the tool call that spawned it. */
   parentToolUseId?: string;
   /**

@@ -10,6 +10,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
   SessionProcessSnapshot,
+  SessionTaskOutputTarget,
 } from '@/shared/types.js';
 
 type ProviderRuntimeServiceDependencies = {
@@ -109,6 +110,23 @@ export function createProviderRuntimeService(
     async stopTask(providerName: LLMProvider, sessionId: string, taskId: string): Promise<boolean> {
       const runtime = dependencies.resolveProvider(providerName).runtime;
       return runtime.stopTask ? Boolean(await runtime.stopTask(sessionId, taskId)) : false;
+    },
+
+    /**
+     * What the session's process knows about one of its tasks: where its
+     * output is being written, and whether it is still running. Null when no
+     * provider has a live process for the session, or none of them reported
+     * that task. The path never leaves this lookup as something a caller can
+     * choose — it is read off the task's own record.
+     */
+    describeSessionTask(sessionId: string, taskId: string): SessionTaskOutputTarget | null {
+      for (const provider of dependencies.listProviders()) {
+        const target = provider.runtime.describeTask?.(sessionId, taskId);
+        if (target) {
+          return target;
+        }
+      }
+      return null;
     },
 
     getSessionProcess(sessionId: string): SessionProcessSnapshot | null {

@@ -18,6 +18,7 @@ import type {
   ProviderRuntimeProcessGateway,
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
+  SessionTaskOutputTarget,
   UpsertProviderMcpServerInput,
 } from '@/shared/types.js';
 
@@ -48,6 +49,14 @@ export interface IProviderRuntime {
    * it. Only providers whose process reports its tasks implement it.
    */
   stopTask?(sessionId: string, taskId: string): boolean | Promise<boolean>;
+  /**
+   * Where one task of the session's process writes its output, and whether it
+   * is still running. Null when the session has no process or the task is
+   * unknown to it. Only providers whose process reports tasks implement it;
+   * it is what keeps the output read route addressed by task id rather than
+   * by a path.
+   */
+  describeTask?(sessionId: string, taskId: string): SessionTaskOutputTarget | null;
   /** The processes the provider keeps alive between turns, when it does. */
   processes?: ProviderRuntimeProcessGateway;
   permissions?: ProviderRuntimePermissionGateway;
