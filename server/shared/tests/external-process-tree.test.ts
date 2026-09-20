@@ -5,11 +5,21 @@ import {
   EXTERNAL_PROCESS_LIMIT,
   EXTERNAL_PROCESS_MIN_AGE_MS,
   parseProcessTable,
+  PROCESS_TABLE_CACHE_TTL_MS,
+  PROCESS_TABLE_IDLE_TIMEOUT_MS,
+  readProcessTable,
+  resetProcessTableCacheForTests,
   walkExternalProcesses,
   type ProcessTableRow,
+  type ReadProcessTableDependencies,
 } from '@/shared/external-process-tree.js';
 
 const NOW = Date.parse('2026-09-17T20:58:22Z');
+
+/** Lets a promise's `.then`/`.catch`/`.finally` chain settle before asserting on it. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 
 function rowAt(
   pid: number,
@@ -193,4 +203,174 @@ test('parseProcessTable reads the pgid column between ppid and lstart', () => {
     ],
   );
   assert.equal(rows[1].name, 'ditto');
+});
+
+// readProcessTable used to run `ps` synchronously on every cache miss, blocking the
+// event loop for the spawn's duration. It now only ever reads a cache a background
+// timer maintains — these tests prove the call itself never waits on a subprocess,
+// and that the edges (cold start, in-flight refresh, a failing `ps`) stay honest.
+const PS_OUTPUT_ONE_ROW = ' 100     1   100 Wed Sep 17 20:57:22 2026 claude\n';
+
+test('readProcessTable returns immediately even while the async ps runner never resolves', (t) => {
+  resetProcessTableCacheForTests();
+  t.after(() => resetProcessTableCacheForTests());
+
+  const deps: ReadProcessTableDependencies = {
+    execFile: () => new Promise(() => {}), // deliberately never settles
+  };
+  const start = Date.now();
+  const rows = readProcessTable(NOW, deps);
+  const elapsed = Date.now() - start;
+
+  assert.ok(elapsed < 50, `expected an immediate return, took ${elapsed}ms`);
+  assert.deepEqual(rows, []);
+});
+
+test('readProcessTable reports nothing before the first background refresh completes (cold start)', async (t) => {
+  resetProcessTableCacheForTests();
+  t.after(() => resetProcessTableCacheForTests());
+
+  const pending: { resolveExec: ((value: { stdout: string; stderr: string }) => void) | null } = {
+    resolveExec: null,
+  };
+  const deps: ReadProcessTableDependencies = {
+    execFile: () =>
+      new Promise((resolve) => {
+        pending.resolveExec = resolve;
+      }),
+  };
+
+  assert.deepEqual(readProcessTable(NOW, deps), []);
+
+  pending.resolveExec?.({ stdout: PS_OUTPUT_ONE_ROW, stderr: '' });
+  await flush();
+
+  assert.deepEqual(readProcessTable(NOW, {}), parseProcessTable(PS_OUTPUT_ONE_ROW));
+});
+
+test('several calls in the same window cost one ps, not one each', async (t) => {
+  resetProcessTableCacheForTests();
+  t.after(() => resetProcessTableCacheForTests());
+
+  let calls = 0;
+  const deps: ReadProcessTableDependencies = {
+    execFile: () => {
+      calls += 1;
+      return Promise.resolve({ stdout: PS_OUTPUT_ONE_ROW, stderr: '' });
+    },
+  };
+
+  readProcessTable(NOW, deps);
+  await flush();
+  readProcessTable(NOW, {});
+  readProcessTable(NOW, {});
+  readProcessTable(NOW, {});
+
+  assert.equal(calls, 1);
+  assert.deepEqual(readProcessTable(NOW, {}), parseProcessTable(PS_OUTPUT_ONE_ROW));
+});
+
+test('a failing ps leaves the cache at [] rather than throwing', async (t) => {
+  resetProcessTableCacheForTests();
+  t.after(() => resetProcessTableCacheForTests());
+
+  const deps: ReadProcessTableDependencies = {
+    execFile: () => Promise.reject(new Error('ps: command not found')),
+  };
+
+  const cold = readProcessTable(NOW, deps);
+  assert.deepEqual(cold, []);
+
+  await flush();
+
+  assert.deepEqual(readProcessTable(NOW, {}), []);
+});
+
+test('a dependency that throws synchronously is handled the same as a rejected spawn', (t) => {
+  resetProcessTableCacheForTests();
+  t.after(() => resetProcessTableCacheForTests());
+
+  const deps: ReadProcessTableDependencies = {
+    execFile: () => {
+      throw new Error('spawn EAGAIN');
+    },
+  };
+
+  assert.deepEqual(readProcessTable(NOW, deps), []);
+});
+
+test('a call landing while a refresh is in flight gets the previous cache, not a wait', async (t) => {
+  resetProcessTableCacheForTests();
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  t.after(() => resetProcessTableCacheForTests());
+
+  let call = 0;
+  const pending: { resolveSecond: ((value: { stdout: string; stderr: string }) => void) | null } = {
+    resolveSecond: null,
+  };
+  const deps: ReadProcessTableDependencies = {
+    execFile: () => {
+      call += 1;
+      if (call === 1) {
+        return Promise.resolve({ stdout: PS_OUTPUT_ONE_ROW, stderr: '' });
+      }
+      return new Promise((resolve) => {
+        pending.resolveSecond = resolve;
+      });
+    },
+  };
+
+  readProcessTable(NOW, deps); // primes the cache and starts the background timer
+  await flush();
+  assert.deepEqual(readProcessTable(NOW, {}), parseProcessTable(PS_OUTPUT_ONE_ROW));
+
+  t.mock.timers.tick(PROCESS_TABLE_CACHE_TTL_MS); // fires the next refresh, which now hangs
+  await flush();
+
+  const duringFlight = readProcessTable(NOW, {});
+  assert.deepEqual(duringFlight, parseProcessTable(PS_OUTPUT_ONE_ROW));
+
+  pending.resolveSecond?.({ stdout: '', stderr: '' });
+  await flush();
+  assert.deepEqual(readProcessTable(NOW, {}), []);
+});
+
+test('the background refresh lapses after enough idle time, and a new call restarts it', async (t) => {
+  resetProcessTableCacheForTests();
+  t.mock.timers.enable({ apis: ['setInterval', 'Date'] });
+  t.after(() => resetProcessTableCacheForTests());
+
+  let calls = 0;
+  const deps: ReadProcessTableDependencies = {
+    execFile: () => {
+      calls += 1;
+      return Promise.resolve({ stdout: PS_OUTPUT_ONE_ROW, stderr: '' });
+    },
+  };
+
+  readProcessTable(NOW, deps); // the only call; everything else is the timer running on its own
+  await flush();
+  assert.equal(calls, 1);
+
+  // node:test's mock Date jumps straight to the target of one big tick() rather than
+  // advancing per fire, which would make every interval callback in the batch see the
+  // same (already-expired) elapsed time. Ticking one TTL at a time, flushing between,
+  // mirrors how the real clock advances one fire at a time.
+  const ticksInsideGracePeriod = Math.floor(PROCESS_TABLE_IDLE_TIMEOUT_MS / PROCESS_TABLE_CACHE_TTL_MS);
+  for (let i = 0; i < ticksInsideGracePeriod; i += 1) {
+    t.mock.timers.tick(PROCESS_TABLE_CACHE_TTL_MS);
+    await flush();
+  }
+  const callsWhileStillWatched = calls;
+  assert.ok(callsWhileStillWatched > 1, 'kept refreshing on its own inside the idle grace period');
+
+  for (let i = 0; i < 3; i += 1) {
+    t.mock.timers.tick(PROCESS_TABLE_CACHE_TTL_MS);
+    await flush();
+  }
+  assert.equal(calls, callsWhileStillWatched, 'no further ps calls once the timer let itself lapse');
+
+  readProcessTable(NOW, deps);
+  await flush();
+  assert.equal(calls, callsWhileStillWatched + 1, 'a new call restarts the refresh cycle');
 });

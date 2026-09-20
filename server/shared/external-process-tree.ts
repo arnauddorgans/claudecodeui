@@ -1,5 +1,6 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 /**
  * One row of the process table, as `ps -axo pid=,ppid=,pgid=,lstart=,comm=`
@@ -32,8 +33,29 @@ export const EXTERNAL_PROCESS_MIN_AGE_MS = 5000;
 /** `externalProcesses` never lists more than this many entries. */
 export const EXTERNAL_PROCESS_LIMIT = 20;
 
-/** How long a process-table read is reused before the next `ps` runs. */
-const PROCESS_TABLE_CACHE_TTL_MS = 1000;
+/** How often the background refresh re-runs `ps` while something is asking for it. */
+export const PROCESS_TABLE_CACHE_TTL_MS = 1000;
+
+/**
+ * How long the background refresh keeps running with nobody calling
+ * `readProcessTable`/`describeExternalProcesses` before it lets itself stop.
+ * A live session polls at least every second or two (`chat_subscribed`,
+ * `session_process` broadcasts, `/sessions/running`), so a handful of missed
+ * ticks means nothing is watching any more — better to stop spawning `ps`
+ * on a timer nobody reads than to keep a process alive that outlives its
+ * last caller by design.
+ */
+export const PROCESS_TABLE_IDLE_TIMEOUT_MS = PROCESS_TABLE_CACHE_TTL_MS * 5;
+
+const PS_ARGS = ['-axo', 'pid=,ppid=,pgid=,lstart=,comm='] as const;
+
+type ExecFileAsync = (
+  file: string,
+  args: readonly string[],
+  options: { encoding: BufferEncoding },
+) => Promise<{ stdout: string; stderr: string }>;
+
+const execFileAsync = promisify(execFile) as ExecFileAsync;
 
 // `Www Mon Dd hh:mm:ss YYYY`, e.g. "Wed Sep 17 20:58:22 2026" — five
 // whitespace-separated tokens, both on macOS and Linux `ps`.
@@ -68,42 +90,119 @@ export function parseProcessTable(output: string): ProcessTableRow[] {
 }
 
 export type ReadProcessTableDependencies = {
-  execFileSync?: typeof execFileSync;
+  /**
+   * Overrides the async `ps` runner the background refresh uses. Test-only:
+   * production always uses the real `execFile`, promisified.
+   */
+  execFile?: ExecFileAsync;
 };
 
-let cache: { rows: ProcessTableRow[]; expiresAt: number } | null = null;
+/**
+ * The last successfully (or unsuccessfully) read process table, or `null`
+ * before the first background refresh has ever completed. `readProcessTable`
+ * never spawns anything itself, so `null` and "`ps` just failed" both read
+ * the same way to a caller: nothing to report.
+ */
+let cache: ProcessTableRow[] | null = null;
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+let refreshInFlight = false;
+let lastRequestAt = 0;
+let activeExecFile: ExecFileAsync = execFileAsync;
 
 /**
- * Reads the process table once, cached for `PROCESS_TABLE_CACHE_TTL_MS` so
- * several `describeExternalProcesses` calls a second (one chat process can
- * back `chat_subscribed`, `session_process` and `/sessions/running` calls in
- * quick succession) cost one `ps`, not one each.
+ * Spawns `ps` asynchronously and replaces `cache` with the result, unless a
+ * spawn is already on the wire — in which case this tick is skipped and the
+ * previous cache stands, rather than piling up overlapping `ps` calls.
+ */
+function refreshProcessTableOnce(): void {
+  if (refreshInFlight) {
+    return;
+  }
+  refreshInFlight = true;
+  let pending: Promise<{ stdout: string }>;
+  try {
+    pending = activeExecFile('ps', PS_ARGS, { encoding: 'utf8' });
+  } catch {
+    // A dependency that throws synchronously instead of rejecting: same
+    // "nothing to report" outcome as a rejected spawn.
+    cache = [];
+    refreshInFlight = false;
+    return;
+  }
+  pending
+    .then(({ stdout }) => {
+      cache = parseProcessTable(stdout);
+    })
+    .catch(() => {
+      // No process table this cycle (e.g. `ps` missing): report nothing rather than throw.
+      cache = [];
+    })
+    .finally(() => {
+      refreshInFlight = false;
+    });
+}
+
+/**
+ * Starts the background refresh on the first call and leaves it running,
+ * unref'd, for as long as something keeps calling — then lets it lapse.
+ * Lazy-start-and-lapse over one interval for the process's whole life: this
+ * module is only ever exercised while `SESSION_PROCESS_EXTERNAL_PROCESSES`
+ * is on and a session is live, so a server that never enables the setting,
+ * or sits with no session open, never pays for a `ps` every second.
+ */
+function ensureRefreshScheduled(deps: ReadProcessTableDependencies): void {
+  if (deps.execFile) {
+    activeExecFile = deps.execFile;
+  }
+  lastRequestAt = Date.now();
+  if (refreshTimer) {
+    return;
+  }
+  refreshProcessTableOnce();
+  refreshTimer = setInterval(() => {
+    if (Date.now() - lastRequestAt > PROCESS_TABLE_IDLE_TIMEOUT_MS) {
+      if (refreshTimer) {
+        clearInterval(refreshTimer);
+      }
+      refreshTimer = null;
+      return;
+    }
+    refreshProcessTableOnce();
+  }, PROCESS_TABLE_CACHE_TTL_MS);
+  refreshTimer.unref?.();
+}
+
+/**
+ * Returns whatever the background refresh currently has cached — never runs
+ * `ps` itself, so this never blocks on a subprocess. Before the first
+ * refresh completes (cold start) this is `[]`: under-reporting is the same
+ * choice `walkExternalProcesses` makes below when the CLI's own row is
+ * missing, and for the same reason. If a refresh is in flight when this is
+ * called, the previous cache is returned rather than waiting on it.
  */
 export function readProcessTable(
   now: number = Date.now(),
   deps: ReadProcessTableDependencies = {},
 ): ProcessTableRow[] {
-  if (cache && now < cache.expiresAt) {
-    return cache.rows;
-  }
-  const run = deps.execFileSync ?? execFileSync;
-  let rows: ProcessTableRow[] = [];
-  try {
-    const output = run('ps', ['-axo', 'pid=,ppid=,pgid=,lstart=,comm='], {
-      encoding: 'utf8',
-    }) as string;
-    rows = parseProcessTable(output);
-  } catch {
-    // No process table this cycle (e.g. `ps` missing): report nothing rather than throw.
-    rows = [];
-  }
-  cache = { rows, expiresAt: now + PROCESS_TABLE_CACHE_TTL_MS };
-  return rows;
+  void now; // kept for interface stability; the cache now runs on its own wall-clock schedule.
+  ensureRefreshScheduled(deps);
+  return cache ?? [];
 }
 
-/** Test-only: forces the next `readProcessTable` call to re-run `ps`. */
+/**
+ * Test-only: drops the cache and stops the background refresh so a fresh
+ * `readProcessTable(now, deps)` call starts a new one with new
+ * dependencies, and no interval leaks into the next test.
+ */
 export function resetProcessTableCacheForTests(): void {
   cache = null;
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+  }
+  refreshTimer = null;
+  refreshInFlight = false;
+  lastRequestAt = 0;
+  activeExecFile = execFileAsync;
 }
 
 /**
