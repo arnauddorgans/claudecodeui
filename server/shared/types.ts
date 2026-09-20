@@ -713,6 +713,42 @@ export type FetchHistoryOptions = {
   limit?: number | null;
   offset?: number;
   providerSessionId?: string;
+  /**
+   * Stopwatch for the request being served, when it is being measured. History
+   * readers only ever call its methods; a reader handed nothing uses the no-op
+   * recorder and measures nothing.
+   */
+  timing?: SessionHistoryTiming;
+};
+
+/**
+ * The per-request recorder a history read is threaded with.
+ *
+ * A phase hands its callback a recorder of its own, and a phase opened on that
+ * one is its child. Parentage is therefore the call tree the reader wrote, not
+ * a guess from whatever was open at the time — which matters because two
+ * phases of one request can run at once, and then a stack's top is not the
+ * opener's parent. A phase reports the wall time it held and, when it had
+ * children, the part of it none of them covered, so a breakdown adds up to the
+ * request instead of double-counting it or going negative.
+ *
+ * Counters are for the sizes that explain a phase — bytes, lines, files — and
+ * notes for the one-word answers, like why the transcript cache missed. Both
+ * belong to the request, not to the phase that recorded them.
+ */
+export type SessionHistoryTiming = {
+  /** `performance.now()`, for a span that cannot be wrapped in a callback. */
+  now(): number;
+  /** Times an awaited phase, which may be starved by the rest of the process. */
+  phase<T>(name: string, run: (timing: SessionHistoryTiming) => Promise<T>): Promise<T>;
+  /** Times a phase that holds the event loop for its whole duration. */
+  phaseSync<T>(name: string, run: (timing: SessionHistoryTiming) => T): T;
+  /** Adds a hand-measured span inside the current phase, summed over its calls. */
+  addMs(name: string, ms: number): void;
+  /** Adds to counter `name`. */
+  count(name: string, amount: number): void;
+  /** Records a one-word answer under `name`; a later, more specific one wins. */
+  note(name: string, value: string): void;
 };
 
 /**

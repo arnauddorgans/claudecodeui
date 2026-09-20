@@ -7,6 +7,7 @@ import { providerModelsService } from '@/modules/providers/services/provider-mod
 import { providerTokenUsageService } from '@/modules/providers/services/provider-token-usage.service.js';
 import { providerSkillsService } from '@/modules/providers/services/skills.service.js';
 import { sessionConversationsSearchService } from '@/modules/providers/services/session-conversations-search.service.js';
+import { beginSessionHistoryRead } from '@/modules/providers/services/session-history-timing.service.js';
 import {
   TASK_OUTPUT_MAX_LIMIT,
   TASK_OUTPUT_MIN_LIMIT,
@@ -892,11 +893,28 @@ router.get(
     const limit = parseBoundedIntegerQuery(req.query.limit, 'limit', null, 0);
     const offset = parseBoundedIntegerQuery(req.query.offset, 'offset', 0, 0);
 
-    const result = await sessionsService.fetchHistory(sessionId, {
-      limit,
-      offset,
-    });
-    res.json(createApiSuccessResponse(result));
+    // The one route that can spend a minute on a page of fifty messages, so it
+    // is the one that says where the minute went. `read` is null when timing is
+    // switched off, and then nothing below is measured.
+    const read = beginSessionHistoryRead({ sessionId, limit, offset });
+    if (!read) {
+      res.json(createApiSuccessResponse(await sessionsService.fetchHistory(sessionId, { limit, offset })));
+      return;
+    }
+
+    // Closed on every path: a recorder left open holds a slot against the
+    // concurrency ceiling and keeps the process probes running for nothing.
+    try {
+      const result = await sessionsService.fetchHistory(sessionId, {
+        limit,
+        offset,
+        timing: read.timing,
+      });
+      const payload = createApiSuccessResponse(result);
+      read.timing.phaseSync('serialize', () => res.json(payload));
+    } finally {
+      await read.finish({ responseBytes: Number(res.getHeader('Content-Length') ?? 0) });
+    }
   }),
 );
 

@@ -1,6 +1,7 @@
 import fsp from 'node:fs/promises';
 
-import type { FetchHistoryResult } from '@/shared/types.js';
+import { noSessionHistoryTiming } from '@/modules/providers/services/session-history-timing.service.js';
+import type { FetchHistoryResult, SessionHistoryTiming } from '@/shared/types.js';
 
 /**
  * Full-transcript cache for session history reads.
@@ -37,8 +38,14 @@ type GetFullHistoryArgs = {
   sessionId: string;
   /** Path of the file the provider's history reader actually parses, or null to bypass. */
   transcriptPath: string | null | undefined;
-  /** Loads the complete transcript (`limit: null, offset: 0`) from the provider. */
-  loadFull: () => Promise<FetchHistoryResult>;
+  /**
+   * Loads the complete transcript (`limit: null, offset: 0`) from the provider,
+   * inside the `load` phase — so the phases the reader opens on the recorder it
+   * is handed are children of `load` rather than siblings of it.
+   */
+  loadFull: (timing: SessionHistoryTiming) => Promise<FetchHistoryResult>;
+  /** Stopwatch for the request, when it is being measured. */
+  timing?: SessionHistoryTiming;
 };
 
 /**
@@ -77,19 +84,25 @@ export function createSessionHistoryCache(
      * the session is not cacheable (no transcript path, or the file cannot be
      * stat'ed) — the caller then falls back to a plain provider read.
      */
-    async getFullHistory({ sessionId, transcriptPath, loadFull }: GetFullHistoryArgs): Promise<FetchHistoryResult | null> {
+    async getFullHistory({ sessionId, transcriptPath, loadFull, timing }: GetFullHistoryArgs): Promise<FetchHistoryResult | null> {
+      const stopwatch = timing ?? noSessionHistoryTiming;
       if (!transcriptPath) {
+        stopwatch.note('cache', 'bypass');
         return null;
       }
 
       let stat;
       try {
-        stat = await fsp.stat(transcriptPath);
+        stat = await stopwatch.phase('cacheStat', () => fsp.stat(transcriptPath));
       } catch {
+        stopwatch.note('cache', 'bypass');
+        stopwatch.note('cacheMiss', 'unstatable');
         entries.delete(sessionId);
         return null;
       }
       if (!stat.isFile()) {
+        stopwatch.note('cache', 'bypass');
+        stopwatch.note('cacheMiss', 'notAFile');
         entries.delete(sessionId);
         return null;
       }
@@ -104,18 +117,38 @@ export function createSessionHistoryCache(
         // Re-insert to mark as most recently used.
         entries.delete(sessionId);
         entries.set(sessionId, cached);
+        stopwatch.note('cache', 'hit');
         return cached.full;
       }
+
+      // Which of the three parts of the key changed is the difference between
+      // a session that is merely open and one that is being written to.
+      stopwatch.note('cache', 'miss');
+      stopwatch.note(
+        'cacheMiss',
+        !cached
+          ? 'absent'
+          : cached.transcriptPath !== transcriptPath
+            ? 'path'
+            : cached.size !== stat.size
+              ? 'size'
+              : 'mtime',
+      );
+      stopwatch.count('cachedBytesBefore', cached?.size ?? 0);
+      stopwatch.count('transcriptBytes', stat.size);
 
       // Concurrent requests for the same session share one parse. The file may
       // gain rows while the load runs; the pre-load stat is what the entry is
       // keyed by, so the next request would see a changed stat and re-read.
       const pending = pendingLoads.get(sessionId);
       if (pending) {
-        return pending;
+        stopwatch.note('cache', 'coalesced');
+        return stopwatch.phase('loadCoalesced', () => pending);
       }
 
-      const load = loadFull().then((full) => {
+      // The reader is handed the `load` phase's own recorder, so everything it
+      // times is recorded inside the load rather than beside it.
+      const load = stopwatch.phase('load', (loadTiming) => loadFull(loadTiming)).then((full) => {
         entries.delete(sessionId);
         entries.set(sessionId, {
           transcriptPath,

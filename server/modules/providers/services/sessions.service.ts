@@ -6,6 +6,7 @@ import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { broadcastSessionUpserted, chatRunRegistry, sessionProcessRegistry } from '@/modules/websocket/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
+import { noSessionHistoryTiming } from '@/modules/providers/services/session-history-timing.service.js';
 import type {
   FetchHistoryOptions,
   FetchHistoryResult,
@@ -424,9 +425,10 @@ export const sessionsService = {
 
   async fetchHistory(
     sessionId: string,
-    options: Pick<FetchHistoryOptions, 'limit' | 'offset'> = {},
+    options: Pick<FetchHistoryOptions, 'limit' | 'offset' | 'timing'> = {},
   ): Promise<FetchHistoryResult> {
-    const session = sessionsDb.getSessionById(sessionId);
+    const timing = options.timing ?? noSessionHistoryTiming;
+    const session = timing.phaseSync('lookup', () => sessionsDb.getSessionById(sessionId));
     if (!session) {
       throw new AppError(`Session "${sessionId}" was not found.`, {
         code: 'SESSION_NOT_FOUND',
@@ -461,22 +463,28 @@ export const sessionsService = {
     const transcriptPath = provider === 'claude' || provider === 'codex'
       ? session.jsonl_path
       : null;
-    const fullHistory = await sessionHistoryCache.getFullHistory({
+    timing.note('provider', provider);
+    const fullHistory = await timing.phase('cache', (cacheTiming) => sessionHistoryCache.getFullHistory({
       sessionId,
       transcriptPath,
-      loadFull: () => providerSessions.fetchHistory(sessionId, {
+      timing: cacheTiming,
+      loadFull: (loadTiming) => providerSessions.fetchHistory(sessionId, {
         limit: null,
         offset: 0,
         projectPath,
         providerSessionId,
+        timing: loadTiming,
       }),
-    });
+    }));
 
     let result: FetchHistoryResult;
     if (fullHistory) {
       // Providers slice with this same helper, so a cached page is identical
       // to what a direct `(limit, offset)` read would have returned.
-      const { page, hasMore } = sliceTailPage(fullHistory.messages, requestedLimit, Math.max(0, requestedOffset));
+      const { page, hasMore } = timing.phaseSync(
+        'slice',
+        () => sliceTailPage(fullHistory.messages, requestedLimit, Math.max(0, requestedOffset)),
+      );
       result = {
         ...fullHistory,
         messages: page,
@@ -485,21 +493,25 @@ export const sessionsService = {
         limit: requestedLimit,
       };
     } else {
-      result = await providerSessions.fetchHistory(sessionId, {
+      result = await timing.phase('providerRead', (readTiming) => providerSessions.fetchHistory(sessionId, {
         limit: requestedLimit,
         offset: requestedOffset,
         projectPath,
         providerSessionId,
-      });
+        timing: readTiming,
+      }));
     }
 
-    return {
+    timing.count('pageMessages', result.messages.length);
+    timing.count('totalMessages', result.total);
+
+    return timing.phaseSync('stamp', () => ({
       ...result,
       messages: result.messages.map((message) => ({
         ...message,
         sessionId,
       })),
-    };
+    }));
   },
 
   /**
