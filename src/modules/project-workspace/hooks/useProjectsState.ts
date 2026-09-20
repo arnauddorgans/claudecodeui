@@ -750,6 +750,12 @@ export function useProjectsState({
         // The model narrating its own tool calls is not news from a session
         // nobody is looking at: it would light the dot every few calls.
         && event.kind !== 'tool_use_summary'
+        // Where a session's process lives, and the tasks it is running, are
+        // bookkeeping rather than something the session said. `session_process`
+        // in particular is broadcast to every client on every start and stop,
+        // so it would light the dot on sessions that produced nothing.
+        && event.kind !== 'session_process'
+        && event.kind !== 'task'
         && event.kind !== 'stream_end'
         && event.kind !== 'permission_resolved'
         && event.kind !== 'permission_cancelled'

@@ -757,6 +757,16 @@ export function useSessionStore() {
       return;
     }
 
+    // Every row this store holds carries an id: the merge keys, dedupes and
+    // reconciles on it. A frame without one is not a message, and letting it
+    // in poisons the slot rather than the frame — the merge is recomputed from
+    // the whole array on every later append, fetch and refresh, so one bad row
+    // breaks the session until the page is reloaded. Refuse it at the door.
+    if (typeof msg.id !== 'string' || !msg.id) {
+      console.warn('[SessionStore] ignored a realtime frame with no id, kind:', msg.kind);
+      return;
+    }
+
     const slot = getSlot(sessionId);
     const normalizedMessage =
       msg.sessionId === sessionId

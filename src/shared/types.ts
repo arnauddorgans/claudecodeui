@@ -197,9 +197,15 @@ export type SessionActivitySnapshot = {
 /**
  * One frame received from the chat websocket. The server guarantees every
  * frame carries a `kind` (provider message kinds plus gateway kinds such as
- * `chat_subscribed`, `session_upserted`, `loading_progress`,
- * `protocol_error`). The synthetic `websocket_reconnected` kind is injected
- * client-side when the socket re-opens after a drop.
+ * `chat_subscribed`, `session_upserted`, `session_process`,
+ * `loading_progress`, `protocol_error`). The synthetic `websocket_reconnected`
+ * kind is injected client-side when the socket re-opens after a drop.
+ *
+ * Only some of those kinds are transcript rows shaped like a
+ * `NormalizedMessage`; the rest carry their own payload and no `id`. Which is
+ * which is decided in one place, `TRANSCRIPT_MESSAGE_KINDS` in
+ * `modules/chat/hooks/useChatRealtimeHandlers.ts` — a frame this client does
+ * not recognise is ignored there rather than treated as a message.
  */
 export type ServerEvent = {
   kind?: string;
@@ -508,6 +514,10 @@ type MessageKind =
   | 'session_created'
   | 'history_truncated'
   | 'task_notification'
+  // A task the session's process is running (a subagent, a backgrounded
+  // shell, a monitor) starting, progressing or ending. Not rendered in the
+  // transcript today; the same records ride on `session_process.tasks`.
+  | 'task'
   | 'tool_use_summary';
 
 // ---------------------------

@@ -63,7 +63,11 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       try {
         listener(event);
       } catch (error) {
-        console.error('WebSocket listener error:', error);
+        // One listener's failure must not stop the others, nor the frames that
+        // follow — the socket is long-lived and there is no second chance at a
+        // frame. The kind is the whole diagnosis: a bare stack names the filter
+        // that threw, never the frame it choked on.
+        console.error('WebSocket listener error on frame kind', event.kind ?? event.type, error);
       }
     }
   }, []);

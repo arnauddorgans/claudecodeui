@@ -14,6 +14,53 @@ const hasActionablePermissionRequests = (requests: Array<{ toolName?: unknown }>
   return Array.isArray(requests) && requests.some((request) => isActionablePermissionRequest(request));
 };
 
+/**
+ * The frame kinds that are transcript rows, and so the only ones the session
+ * store is allowed to hold.
+ *
+ * An allow-list, because the server's frame vocabulary grows faster than this
+ * client's: everything the routing below does not name used to fall through to
+ * `appendRealtime`, which is how the gateway's `session_process` — a process
+ * snapshot, not a message, carrying no `id` — ended up in `realtimeMessages`,
+ * where the reconciliation that merges live rows with history reads `id` on
+ * every recompute. It threw there for the rest of the page's life, not only on
+ * the frame that brought it, so loading, paging and sending all stopped until a
+ * reload.
+ *
+ * A kind missing from this set renders nothing, which is visible and
+ * recoverable; an unknown kind in the store breaks the session. `stream_delta`
+ * is routed separately above (buffered for the viewed session, appended for the
+ * others) and so is deliberately absent here.
+ */
+const TRANSCRIPT_MESSAGE_KINDS: ReadonlySet<string> = new Set([
+  'text',
+  'tool_use',
+  'tool_result',
+  'thinking',
+  'error',
+  'task_notification',
+]);
+
+/**
+ * `status.text` values that say which status a frame is rather than what to
+ * show for it.
+ *
+ * `token_budget` has always had its own branch below. `activity` (the CLI
+ * compacting or waiting on the model) and `thinking_tokens` (its running
+ * estimate) were added server-side after this switch was written, and both
+ * carry their payload in their own fields — `activity`, `thinkingTokens` —
+ * with no sentence for a person. Falling through to the label branch printed
+ * the discriminator itself, so the composer's spinner read "thinking_tokens"
+ * through the middle of a turn. Rendering what they actually say is a feature;
+ * until it exists the session is simply busy, and the default rotating label
+ * applies.
+ */
+const NON_LABEL_STATUS_TEXTS: ReadonlySet<string> = new Set([
+  'token_budget',
+  'activity',
+  'thinking_tokens',
+]);
+
 type UseChatRealtimeHandlersArgs = {
   isActive: boolean;
   subscribe: (listener: (event: ServerEvent) => void) => () => void;
@@ -220,15 +267,8 @@ export function useChatRealtimeHandlers({
         return;
       }
 
-      // --- All other messages: route to store ---
-      const shouldPersist =
-        msg.kind !== 'complete'
-        && msg.kind !== 'status'
-        && msg.kind !== 'permission_request'
-        && msg.kind !== 'permission_resolved'
-        && msg.kind !== 'permission_cancelled';
-
-      if (sid && shouldPersist) {
+      // --- Transcript rows: route to store; every other frame is ignored ---
+      if (sid && TRANSCRIPT_MESSAGE_KINDS.has(msg.kind)) {
         sessionStore.appendRealtime(sid, msg as unknown as NormalizedMessage);
       }
 
@@ -334,8 +374,9 @@ export function useChatRealtimeHandlers({
               setTokenBudget(msg.tokenBudget as Record<string, unknown>);
             }
           } else if (msg.text && sid) {
+            const text = msg.text as string;
             onSessionProcessing?.(sid, {
-              statusText: msg.text as string,
+              statusText: NON_LABEL_STATUS_TEXTS.has(text) ? null : text,
               canInterrupt: msg.canInterrupt !== false,
             });
           }
