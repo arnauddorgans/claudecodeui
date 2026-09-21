@@ -679,12 +679,22 @@ async function getSessionMessages(
  * content-level check the same payload renders as a huge user bubble during the
  * run and then vanishes on reload. The skill is already represented by the
  * `Skill` tool call, so it is never user-visible content.
+ *
+ * `<task-notification>` belongs in the first group too, for the same
+ * live-vs-persisted reason. `collectTaskNotifications` folds it onto the
+ * `Agent` call's own row, but only history reading builds the whole-transcript
+ * view that function needs — a live stream normalizes one row at a time, with
+ * no earlier row to fold onto. Without this check a background agent's
+ * finished-report turn rendered as a bare user bubble the moment it streamed
+ * in, and only stopped looking like the session's own message once the page
+ * reloaded and the fold ran.
  */
 const INTERNAL_CONTENT_PREFIXES = [
   '<system-reminder>',
   'Caveat:',
   '[Request interrupted',
   'Base directory for this skill:',
+  '<task-notification>',
 ] as const;
 
 function isInternalContent(content: string): boolean {
@@ -1017,6 +1027,14 @@ export class ClaudeSessionsProvider implements IProviderSessions {
    * applied here rather than at each `createNormalizedMessage` call because the
    * row-shape branches below have several exits, and an anchor missing from one
    * of them would show up as a message the user silently cannot edit.
+   *
+   * The row's top-level `parent_tool_use_id` is stamped here for the same
+   * reason: it names the `Agent` tool call a message came from when the SDK
+   * forwards a subagent's own traffic inline with the session's, and every
+   * `kind` `normalizeMessageRows` can produce needs it, not just the ones that
+   * happen to read it themselves today. `normalizeClaudeTaskMessage` already
+   * reads it directly for `kind: 'task'`, so this only fills the field in when
+   * a branch left it unset — it never overrides that reading.
    */
   normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
     const messages = this.normalizeMessageRows(rawMessage, sessionId);
@@ -1028,6 +1046,15 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       for (const message of messages) {
         if (message.role === 'user') {
           message.transcriptAnchorId = anchorId;
+        }
+      }
+    }
+
+    const parentToolUseId = readOptionalString(raw?.parent_tool_use_id);
+    if (parentToolUseId !== undefined) {
+      for (const message of messages) {
+        if (message.parentToolUseId === undefined) {
+          message.parentToolUseId = parentToolUseId;
         }
       }
     }

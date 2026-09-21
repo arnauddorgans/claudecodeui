@@ -209,6 +209,62 @@ test('Claude history folds an agent task notification into the call that spawned
   }
 });
 
+test('a live task notification row normalizes to nothing, the same as history folds it away', () => {
+  // `collectTaskNotifications` only runs over a whole transcript, which only
+  // history reading has: it folds the notification onto the `Agent` call's
+  // own row and drops the raw row from what it returns. A live stream has no
+  // such pass — the SDK hands `normalizeMessage` one row at a time — so
+  // without this the notification's raw `<task-notification>` tag rendered as
+  // an ordinary user bubble the instant it streamed in, and only stopped
+  // looking like the session's own message once the page reloaded and the
+  // history fold ran.
+  const notificationRow = {
+    type: 'user',
+    uuid: 'notification-1',
+    sessionId: SESSION_ID,
+    timestamp: '2026-08-21T10:05:00.000Z',
+    message: {
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: [
+          '<task-notification>',
+          `<task-id>${AGENT_ID}</task-id>`,
+          `<tool-use-id>${AGENT_TOOL_USE_ID}</tool-use-id>`,
+          '<status>completed</status>',
+          '<summary>Agent "Survey the repo" finished</summary>',
+          '<result>The repo has two packages.</result>',
+          '</task-notification>',
+        ].join('\n'),
+      }],
+    },
+  };
+
+  assert.deepEqual(new ClaudeSessionsProvider().normalizeMessage(notificationRow, SESSION_ID), []);
+});
+
+test('a live task notification sent as plain string content also normalizes to nothing', () => {
+  const notificationRow = {
+    type: 'user',
+    uuid: 'notification-2',
+    sessionId: SESSION_ID,
+    timestamp: '2026-08-21T10:05:00.000Z',
+    message: {
+      role: 'user',
+      content: [
+        '<task-notification>',
+        `<task-id>${AGENT_ID}</task-id>`,
+        `<tool-use-id>${AGENT_TOOL_USE_ID}</tool-use-id>`,
+        '<status>completed</status>',
+        '<summary>Agent "Survey the repo" finished</summary>',
+        '</task-notification>',
+      ].join('\n'),
+    },
+  };
+
+  assert.deepEqual(new ClaudeSessionsProvider().normalizeMessage(notificationRow, SESSION_ID), []);
+});
+
 /** Strips the `<task-notification>` turn so the agent has no reported outcome. */
 async function dropTaskNotification(parentPath: string): Promise<void> {
   const raw = await readFile(parentPath, 'utf8');

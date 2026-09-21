@@ -114,3 +114,76 @@ test('other system events and task events without an id produce nothing', () => 
   assert.deepEqual(normalize({ type: 'system', subtype: 'task_started', description: 'no id', session_id: 'sid' }), []);
   assert.deepEqual(normalize({ type: 'system', subtype: 'background_tasks_changed', session_id: 'sid' }), []);
 });
+
+/**
+ * `parent_tool_use_id` is a top-level field on every SDK stream message, not
+ * just the task events above — `normalizeClaudeTaskMessage` is only the one
+ * normalizer that happened to read it directly. `normalizeMessage` now stamps
+ * it onto whatever `kind` a row produces, so a subagent's own text, thinking,
+ * tool call or tool result carries the same attribution a task frame always
+ * has, instead of looking like the session's own the moment it reaches a
+ * kind nobody added the field to by hand.
+ */
+test('an assistant text message forwards the tool call it came from', () => {
+  const [frame] = normalize({
+    type: 'assistant',
+    parent_tool_use_id: 'toolu_agent',
+    uuid: 'u-text',
+    session_id: 'sid',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Found three files.' }] },
+  });
+  assert.equal(frame.kind, 'text');
+  assert.equal(frame.parentToolUseId, 'toolu_agent');
+});
+
+test('the session\'s own assistant text carries no parent at all, not a null one', () => {
+  const [frame] = normalize({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    uuid: 'u-text-main',
+    session_id: 'sid',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] },
+  });
+  assert.equal(frame.kind, 'text');
+  assert.equal(Object.hasOwn(frame, 'parentToolUseId'), false, 'wire callers expect the field absent, never null');
+});
+
+test('a subagent\'s thinking block forwards the tool call it came from', () => {
+  const [frame] = normalize({
+    type: 'assistant',
+    parent_tool_use_id: 'toolu_agent',
+    uuid: 'u-thinking',
+    session_id: 'sid',
+    message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'Let me check the config.' }] },
+  });
+  assert.equal(frame.kind, 'thinking');
+  assert.equal(frame.parentToolUseId, 'toolu_agent');
+});
+
+test('a subagent\'s own tool call and its result forward the tool call it came from', () => {
+  const [toolUse] = normalize({
+    type: 'assistant',
+    parent_tool_use_id: 'toolu_agent',
+    uuid: 'u-tool-use',
+    session_id: 'sid',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_child', name: 'Read', input: { file_path: '/a.txt' } }] },
+  });
+  assert.equal(toolUse.kind, 'tool_use');
+  assert.equal(toolUse.parentToolUseId, 'toolu_agent');
+
+  const [toolResult] = normalize({
+    type: 'user',
+    parent_tool_use_id: 'toolu_agent',
+    uuid: 'u-tool-result',
+    session_id: 'sid',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_child', content: 'ok' }] },
+  });
+  assert.equal(toolResult.kind, 'tool_result');
+  assert.equal(toolResult.parentToolUseId, 'toolu_agent');
+});
+
+test('a task frame keeps reading parent_tool_use_id directly, untouched by the generic stamp', () => {
+  const [frame] = normalize({ ...started, parent_tool_use_id: 'toolu_parent' });
+  assert.equal(frame.kind, 'task');
+  assert.equal(frame.parentToolUseId, 'toolu_parent');
+});
