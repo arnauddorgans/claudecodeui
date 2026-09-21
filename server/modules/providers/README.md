@@ -426,9 +426,16 @@ busy with that work: two processes resumed the same transcript and both appended
   and one that leads its own group is the turn's work, everything below it included. The group is read
   off the CLI's own row, so the rule holds whether or not the CLI was itself spawned detached; if that
   row is missing (a `ps` read racing session shutdown) nothing is pruned, since listing too much beats
-  reporting an idle session. The process-table read (`ps -axo pid=,ppid=,pgid=,lstart=,comm=`) is cached
-  for 1 second so several snapshots a second cost one read. When the setting is off, `externalProcesses`
-  is absent from the snapshot and nothing about how the CLI is spawned changes.
+  reporting an idle session. The process-table read (`ps -axo pid=,ppid=,pgid=,lstart=,comm=`) happens on
+  a background refresh, once a second, never on the request path, so a snapshot is a cache read and can
+  never block on a subprocess; the refresh starts on the first call and lapses, cache and all, after five
+  idle seconds. That cache is up to a second-plus-one-`ps` behind reality, so the tree's shape comes from
+  it while each entry's existence is confirmed against the kernel as the list is built (`kill(pid, 0)`, a
+  syscall, not a spawn) — otherwise a turn spawning short-lived processes reports pids that have already
+  exited, as the "pro" instance did with 7 of 20. A row the table still shows as a parent can be gone
+  while its children run on: it is dropped from the list without its subtree being dropped with it.
+  When the setting is off, `externalProcesses` is absent from the snapshot and nothing about how the CLI
+  is spawned changes.
 
 ## Claude: tasks and subagents
 

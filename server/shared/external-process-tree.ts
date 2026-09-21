@@ -97,6 +97,36 @@ export type ReadProcessTableDependencies = {
   execFile?: ExecFileAsync;
 };
 
+export type DescribeExternalProcessesDependencies = ReadProcessTableDependencies & {
+  /**
+   * Overrides the liveness probe. Test-only: production always uses
+   * `processIsAlive`, since a fabricated table's pids are not processes on the
+   * machine running the tests.
+   */
+  isAlive?: (pid: number) => boolean;
+};
+
+/**
+ * Whether `pid` is a process on this machine right now — `kill(pid, 0)`, which
+ * delivers no signal and only reports whether the pid could be signalled. A
+ * syscall, not a spawn, so this is free enough to run over every entry of a
+ * served list. `EPERM` means the process exists and belongs to someone else:
+ * alive, just not ours. Anything else (`ESRCH`) means it is gone.
+ */
+export function processIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    // `kill(0, …)` addresses the caller's whole process group and `kill(-1, …)`
+    // every process it may signal: neither is a question about one pid.
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
 /**
  * The last successfully (or unsuccessfully) read process table, or `null`
  * before the first background refresh has ever completed. `readProcessTable`
@@ -165,6 +195,12 @@ function ensureRefreshScheduled(deps: ReadProcessTableDependencies): void {
         clearInterval(refreshTimer);
       }
       refreshTimer = null;
+      // The table goes with the timer that maintained it. Kept, it would be
+      // served whole to the call that restarts the refresh, however many
+      // minutes or hours later — the one staleness this module has no bound
+      // on. Dropping it makes that call a cold start instead, which already
+      // reports nothing rather than a guess.
+      cache = null;
       return;
     }
     refreshProcessTableOnce();
@@ -175,10 +211,14 @@ function ensureRefreshScheduled(deps: ReadProcessTableDependencies): void {
 /**
  * Returns whatever the background refresh currently has cached — never runs
  * `ps` itself, so this never blocks on a subprocess. Before the first
- * refresh completes (cold start) this is `[]`: under-reporting is the same
- * choice `walkExternalProcesses` makes below when the CLI's own row is
- * missing, and for the same reason. If a refresh is in flight when this is
- * called, the previous cache is returned rather than waiting on it.
+ * refresh completes (cold start) this is `[]`, and so is the call that restarts
+ * a lapsed refresh, which drops the table it was maintaining: under-reporting
+ * is the same choice `walkExternalProcesses` makes below when the CLI's own row
+ * is missing, and for the same reason. If a refresh is in flight when this is
+ * called, the previous cache is returned rather than waiting on it — so what
+ * comes back is up to `PROCESS_TABLE_CACHE_TTL_MS` plus one `ps` behind
+ * reality, which is why `describeExternalProcesses` confirms each entry it
+ * serves rather than trusting the rows to still exist.
  */
 export function readProcessTable(
   now: number = Date.now(),
@@ -209,7 +249,13 @@ export function resetProcessTableCacheForTests(): void {
  * Walks the process table from `rootPid` (exclusive, never itself listed)
  * and returns every live descendant older than `EXTERNAL_PROCESS_MIN_AGE_MS`,
  * breadth-first, capped at `EXTERNAL_PROCESS_LIMIT`. Pure and synchronous so
- * a fabricated table can drive it directly in tests.
+ * a fabricated table can drive it directly in tests, `isAlive` included: its
+ * default trusts the table, and `describeExternalProcesses` is what passes the
+ * real probe, because only there are the pids this machine's own.
+ *
+ * `isAlive` decides what is *reported*, never what is walked: the table is up
+ * to a refresh behind, so a row it shows as a parent may already be gone while
+ * the children under it run on, reparented. Pruning its subtree would lose them.
  *
  * A session's own infrastructure is dropped, with its subtree: MCP servers and
  * language servers stay in the CLI's process group, while the CLI starts each
@@ -231,6 +277,7 @@ export function walkExternalProcesses(
   rows: ProcessTableRow[],
   rootPid: number,
   now: number = Date.now(),
+  isAlive: (pid: number) => boolean = () => true,
 ): ExternalProcess[] {
   const children = new Map<number, ProcessTableRow[]>();
   let cliPgid: number | null = null;
@@ -269,7 +316,7 @@ export function walkExternalProcesses(
     }
 
     const age = row.startedAt === null ? Number.POSITIVE_INFINITY : now - row.startedAt;
-    if (age > EXTERNAL_PROCESS_MIN_AGE_MS) {
+    if (age > EXTERNAL_PROCESS_MIN_AGE_MS && isAlive(row.pid)) {
       result.push({ pid: row.pid, name: row.name, startedAt: row.startedAt ?? now });
     }
     queue.push(...(children.get(row.pid) ?? []));
@@ -283,10 +330,24 @@ export function walkExternalProcesses(
  * capped at 20, minus the session's own infrastructure — what
  * `SessionProcessSnapshot.externalProcesses` reports.
  * Nothing to clean up here: this only observes the process table.
+ *
+ * The tree's shape (who descends from whom, in which group, since when) comes
+ * from the cached table, which the background refresh leaves up to a TTL plus
+ * one `ps` behind; whether each entry still exists is asked of the kernel here,
+ * at the moment the list is built. That gap is what showed on the live "pro"
+ * instance as 7 of 20 reported pids that `ps -p` said were already gone: a
+ * session whose turn spawns short-lived processes buries several deaths in every
+ * refresh window. Confirming beats shortening the TTL — a `ps` costs a spawn and
+ * a few hundred milliseconds, `kill(pid, 0)` a syscall — and beats forcing a
+ * fresh read on the request path, which is what `bed64a57` moved off it.
  */
-export function describeExternalProcesses(rootPid: number, now: number = Date.now()): ExternalProcess[] {
+export function describeExternalProcesses(
+  rootPid: number,
+  now: number = Date.now(),
+  deps: DescribeExternalProcessesDependencies = {},
+): ExternalProcess[] {
   if (!rootPid) {
     return [];
   }
-  return walkExternalProcesses(readProcessTable(now), rootPid, now);
+  return walkExternalProcesses(readProcessTable(now, deps), rootPid, now, deps.isAlive ?? processIsAlive);
 }

@@ -2,14 +2,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  describeExternalProcesses,
   EXTERNAL_PROCESS_LIMIT,
   EXTERNAL_PROCESS_MIN_AGE_MS,
   parseProcessTable,
   PROCESS_TABLE_CACHE_TTL_MS,
   PROCESS_TABLE_IDLE_TIMEOUT_MS,
+  processIsAlive,
   readProcessTable,
   resetProcessTableCacheForTests,
   walkExternalProcesses,
+  type DescribeExternalProcessesDependencies,
   type ProcessTableRow,
   type ReadProcessTableDependencies,
 } from '@/shared/external-process-tree.js';
@@ -373,4 +376,124 @@ test('the background refresh lapses after enough idle time, and a new call resta
   readProcessTable(NOW, deps);
   await flush();
   assert.equal(calls, callsWhileStillWatched + 1, 'a new call restarts the refresh cycle');
+});
+
+// The cache the background refresh maintains is up to a TTL plus one `ps` behind
+// reality, and a lapsed refresh leaves one behind with no bound on its age at all.
+// Measured on the live "pro" instance: `/api/providers/sessions/running` reported
+// 20 `externalProcesses` for a busy session, 7 of whose pids `ps -p` said were
+// already gone. So what is served is confirmed against the kernel at serve time,
+// and a lapsed refresh's table is not served as if it were current.
+const PS_OUTPUT_TREE =
+  [
+    ' 100     1   100 Wed Sep 17 20:57:22 2026 claude',
+    ' 200   100   200 Wed Sep 17 20:57:24 2026 /bin/zsh',
+    ' 300   200   200 Wed Sep 17 20:57:26 2026 /bin/sleep',
+    '',
+  ].join('\n');
+
+/** A fake process table plus a liveness set the test can kill entries out of. */
+function depsForTree(alive: Set<number>): DescribeExternalProcessesDependencies {
+  return {
+    execFile: () => Promise.resolve({ stdout: PS_OUTPUT_TREE, stderr: '' }),
+    isAlive: (pid: number) => alive.has(pid),
+  };
+}
+
+test('a descendant that died since the last refresh is not listed as still running', async (t) => {
+  resetProcessTableCacheForTests();
+  t.after(() => resetProcessTableCacheForTests());
+
+  const alive = new Set([100, 200, 300]);
+  const deps = depsForTree(alive);
+
+  readProcessTable(NOW, deps); // primes the cache from that table
+  await flush();
+  assert.deepEqual(describeExternalProcesses(100, NOW, deps).map((p) => p.pid), [200, 300]);
+
+  // The `sleep` exits. The cached table still carries its row until the next refresh.
+  alive.delete(300);
+
+  assert.deepEqual(describeExternalProcesses(100, NOW, deps).map((p) => p.pid), [200]);
+});
+
+test('a dead parent is dropped without dropping the live subtree under it', async (t) => {
+  resetProcessTableCacheForTests();
+  t.after(() => resetProcessTableCacheForTests());
+
+  // The shell exited but the `sleep` it started outlives it, reparented by the
+  // kernel — the cached table still shows it under the shell.
+  const alive = new Set([100, 300]);
+  const deps = depsForTree(alive);
+
+  readProcessTable(NOW, deps);
+  await flush();
+
+  assert.deepEqual(describeExternalProcesses(100, NOW, deps).map((p) => p.pid), [300]);
+});
+
+test('every entry dying leaves an empty list, not the last one that was reported', async (t) => {
+  resetProcessTableCacheForTests();
+  t.after(() => resetProcessTableCacheForTests());
+
+  const alive = new Set([100, 200, 300]);
+  const deps = depsForTree(alive);
+
+  readProcessTable(NOW, deps);
+  await flush();
+  assert.equal(describeExternalProcesses(100, NOW, deps).length, 2);
+
+  alive.delete(200);
+  alive.delete(300);
+
+  assert.deepEqual(describeExternalProcesses(100, NOW, deps), []);
+});
+
+test('the table a lapsed refresh left behind is not served as if it were current', async (t) => {
+  resetProcessTableCacheForTests();
+  t.mock.timers.enable({ apis: ['setInterval', 'Date'] });
+  t.after(() => resetProcessTableCacheForTests());
+
+  const deps: ReadProcessTableDependencies = {
+    execFile: () => Promise.resolve({ stdout: PS_OUTPUT_ONE_ROW, stderr: '' }),
+  };
+
+  readProcessTable(NOW, deps);
+  await flush();
+  assert.deepEqual(readProcessTable(NOW, deps), parseProcessTable(PS_OUTPUT_ONE_ROW));
+
+  // Nothing calls for long enough that the refresh lets itself stop. Whatever it
+  // last read is now of unbounded age: the machine has moved on since.
+  const ticksToLapse = Math.floor(PROCESS_TABLE_IDLE_TIMEOUT_MS / PROCESS_TABLE_CACHE_TTL_MS) + 3;
+  for (let i = 0; i < ticksToLapse; i += 1) {
+    t.mock.timers.tick(PROCESS_TABLE_CACHE_TTL_MS);
+    await flush();
+  }
+
+  assert.deepEqual(readProcessTable(NOW, deps), [], 'the first call after a lapse reports nothing');
+
+  await flush(); // the same call restarted the refresh; one `ps` later there is a table again
+  assert.deepEqual(readProcessTable(NOW, deps), parseProcessTable(PS_OUTPUT_ONE_ROW));
+});
+
+test('processIsAlive says yes for this very process and no for a pid that cannot exist', () => {
+  assert.equal(processIsAlive(process.pid), true);
+  assert.equal(processIsAlive(0), false);
+  assert.equal(processIsAlive(-1), false);
+});
+
+test('walkExternalProcesses keeps its pure default: every row in the table is live', () => {
+  // The fabricated pids of the tests above are not processes on this machine, so
+  // the walk's own default has to stay "the table is the truth" — the liveness
+  // probe belongs to describeExternalProcesses, which knows the pids are real.
+  const rows: ProcessTableRow[] = [
+    rowAt(100_000_001, 1, 60_000, 'claude'),
+    rowAt(100_000_002, 100_000_001, 60_000, 'zsh'),
+  ];
+
+  assert.deepEqual(walkExternalProcesses(rows, 100_000_001, NOW).map((p) => p.pid), [100_000_002]);
+});
+
+test('describeExternalProcesses reports nothing for a session with no captured cli pid', () => {
+  assert.deepEqual(describeExternalProcesses(0, NOW), []);
 });
