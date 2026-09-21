@@ -497,6 +497,33 @@ const parseSessionEffortPayload = (payload: unknown): string => {
   return effort;
 };
 
+const parseSessionPermissionModePayload = (payload: unknown): string => {
+  if (!payload || typeof payload !== 'object') {
+    throw new AppError('Request body must be an object.', {
+      code: 'INVALID_REQUEST_BODY',
+      statusCode: 400,
+    });
+  }
+
+  const body = payload as Record<string, unknown>;
+  const permissionMode = readOptionalQueryString(body.permissionMode);
+  if (!permissionMode) {
+    throw new AppError('permissionMode is required.', {
+      code: 'PERMISSION_MODE_REQUIRED',
+      statusCode: 400,
+    });
+  }
+
+  if (permissionMode.length > 32) {
+    throw new AppError('permissionMode must be 32 characters or fewer.', {
+      code: 'INVALID_PERMISSION_MODE',
+      statusCode: 400,
+    });
+  }
+
+  return permissionMode;
+};
+
 const parseModelRecordId = (value: unknown): number => {
   const rawRecordId = readPathParam(value, 'recordId').trim();
   if (!/^\d+$/.test(rawRecordId)) {
@@ -634,7 +661,7 @@ router.post(
     // A session row only exists once the gateway has allocated one. Report the
     // selection back either way so the client can hold it until the first send.
     res.json(createApiSuccessResponse(
-      stored ?? { provider, sessionId, model, effort: null, source: 'session' as const },
+      stored ?? { provider, sessionId, model, effort: null, permissionMode: null, source: 'session' as const },
     ));
   }),
 );
@@ -651,6 +678,22 @@ router.post(
     // before the session gateway created its row.
     res.json(createApiSuccessResponse(
       stored ?? { provider, sessionId, effort, source: 'session' as const },
+    ));
+  }),
+);
+
+/** Records the permission-mode choice for one app session. */
+router.post(
+  '/:provider/sessions/:sessionId/active-permission-mode',
+  asyncHandler(async (req: Request, res: Response) => {
+    const provider = parseProvider(req.params.provider);
+    const sessionId = parseSessionId(req.params.sessionId);
+    const permissionMode = parseSessionPermissionModePayload(req.body);
+    const stored = providerModelsService.setSessionPermissionMode(provider, sessionId, permissionMode);
+    // Mirror active-model/active-effort behavior for a composer that picked a
+    // mode just before the session gateway created its row.
+    res.json(createApiSuccessResponse(
+      stored ?? { provider, sessionId, permissionMode, source: 'session' as const },
     ));
   }),
 );

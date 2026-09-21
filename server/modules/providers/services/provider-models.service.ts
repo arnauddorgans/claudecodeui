@@ -14,9 +14,12 @@ import { AppError } from '@/shared/utils.js';
 
 /** Session-row access the service needs, narrowed so tests can stub it. */
 type ProviderModelsSessionStore = {
-  getSessionById(sessionId: string): { model: string | null; effort: string | null } | null;
+  getSessionById(
+    sessionId: string,
+  ): { model: string | null; effort: string | null; permission_mode: string | null } | null;
   setSessionModel(sessionId: string, model: string): void;
   setSessionEffort(sessionId: string, effort: string): void;
+  setSessionPermissionMode(sessionId: string, permissionMode: string): void;
 };
 
 /** SQLite catalog operations used by the Providers service and its unit fakes. */
@@ -213,7 +216,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
 
   const readRecordedSessionSelection = (
     sessionId: string,
-  ): { model: string | null; effort: string | null } | null => {
+  ): { model: string | null; effort: string | null; permissionMode: string | null } | null => {
     const session = sessions.getSessionById(sessionId);
     if (!session) {
       return null;
@@ -222,6 +225,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
     return {
       model: session.model?.trim() || null,
       effort: session.effort?.trim() || null,
+      permissionMode: session.permission_mode?.trim() || null,
     };
   };
 
@@ -256,6 +260,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
       sessionId: normalizedSessionId,
       model: normalizedModel,
       effort: recordedSelection.effort,
+      permissionMode: recordedSelection.permissionMode,
       source: 'session',
     };
   };
@@ -292,6 +297,37 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
   };
 
   /**
+   * Records the permission mode one session runs with.
+   *
+   * Like `setSessionModel`/`setSessionEffort`, this ignores an id that has not
+   * been allocated by the session gateway yet, so a pre-session composer
+   * choice is not lost — it lands on the row with the first send instead.
+   */
+  const setSessionPermissionMode = (
+    provider: LLMProvider,
+    sessionId: string,
+    permissionMode: string,
+  ): { provider: LLMProvider; sessionId: string; permissionMode: string; source: 'session' } | null => {
+    const normalizedSessionId = sessionId.trim();
+    const normalizedPermissionMode = permissionMode.trim();
+    if (!normalizedSessionId || !normalizedPermissionMode) {
+      return null;
+    }
+
+    if (!readRecordedSessionSelection(normalizedSessionId)) {
+      return null;
+    }
+
+    sessions.setSessionPermissionMode(normalizedSessionId, normalizedPermissionMode);
+    return {
+      provider,
+      sessionId: normalizedSessionId,
+      permissionMode: normalizedPermissionMode,
+      source: 'session',
+    };
+  };
+
+  /**
    * Answers "which model is this session using?" for every display surface.
    *
    * Precedence, highest first:
@@ -317,6 +353,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
           sessionId: normalizedSessionId,
           model: recordedSelection.model,
           effort: recordedSelection.effort,
+          permissionMode: recordedSelection.permissionMode,
           source: 'session',
         };
       }
@@ -330,6 +367,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
           sessionId: normalizedSessionId,
           model: resolvedProviderModel,
           effort: recordedSelection?.effort ?? null,
+          permissionMode: recordedSelection?.permissionMode ?? null,
           source: 'provider',
         };
       }
@@ -339,6 +377,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
         sessionId: normalizedSessionId,
         model: normalizedRequestedModel || providerCatalog.DEFAULT,
         effort: recordedSelection?.effort ?? null,
+        permissionMode: recordedSelection?.permissionMode ?? null,
         source: normalizedRequestedModel ? 'session' : 'default',
       };
     }
@@ -349,6 +388,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
         sessionId: null,
         model: normalizedRequestedModel,
         effort: null,
+        permissionMode: null,
         source: 'session',
       };
     }
@@ -359,6 +399,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
       sessionId: null,
       model: providerCatalog.DEFAULT,
       effort: null,
+      permissionMode: null,
       source: 'default',
     };
   };
@@ -392,6 +433,7 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
     deleteCustomModel,
     setSessionModel,
     setSessionEffort,
+    setSessionPermissionMode,
     resolveSessionModel,
     resolveResumeModel,
   };

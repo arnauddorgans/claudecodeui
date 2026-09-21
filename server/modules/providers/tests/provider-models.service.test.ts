@@ -22,10 +22,11 @@ const createCurrentActiveModel = (model: string): ProviderCurrentActiveModel => 
 const createSessionStore = (
   rows: Record<string, string | null> = {},
   efforts: Record<string, string | null> = {},
+  permissionModes: Record<string, string | null> = {},
 ) => {
   const sessions = new Map(Object.entries(rows).map(([sessionId, model]) => [
     sessionId,
-    { model, effort: efforts[sessionId] ?? null },
+    { model, effort: efforts[sessionId] ?? null, permission_mode: permissionModes[sessionId] ?? null },
   ]));
   return {
     sessions,
@@ -41,6 +42,12 @@ const createSessionStore = (
       const session = sessions.get(sessionId);
       if (session) {
         session.effort = effort;
+      }
+    },
+    setSessionPermissionMode: (sessionId: string, permissionMode: string) => {
+      const session = sessions.get(sessionId);
+      if (session) {
+        session.permission_mode = permissionMode;
       }
     },
   };
@@ -227,6 +234,7 @@ test('setSessionModel records the model on the session row', () => {
     sessionId: 'session-1',
     model: 'opus',
     effort: null,
+    permissionMode: null,
     source: 'session',
   });
   assert.equal(sessions.sessions.get('session-1')?.model, 'opus');
@@ -263,9 +271,36 @@ test('setSessionEffort ignores sessions that have no row yet', () => {
   assert.equal(sessions.sessions.size, 0);
 });
 
+test('setSessionPermissionMode records an explicit mode on the session row', () => {
+  const sessions = createSessionStore({ 'session-1': 'gpt-5.6-sol' });
+  const { service } = createTestService({ sessions });
+
+  const stored = service.setSessionPermissionMode('codex', 'session-1', 'plan');
+
+  assert.deepEqual(stored, {
+    provider: 'codex',
+    sessionId: 'session-1',
+    permissionMode: 'plan',
+    source: 'session',
+  });
+  assert.equal(sessions.sessions.get('session-1')?.permission_mode, 'plan');
+});
+
+test('setSessionPermissionMode ignores sessions that have no row yet', () => {
+  const sessions = createSessionStore();
+  const { service } = createTestService({ sessions });
+
+  assert.equal(service.setSessionPermissionMode('codex', 'missing-session', 'plan'), null);
+  assert.equal(sessions.sessions.size, 0);
+});
+
 test('resolveSessionModel prefers the recorded session model', async () => {
   const { service } = createTestService({
-    sessions: createSessionStore({ 'session-1': 'haiku' }, { 'session-1': 'high' }),
+    sessions: createSessionStore(
+      { 'session-1': 'haiku' },
+      { 'session-1': 'high' },
+      { 'session-1': 'acceptEdits' },
+    ),
     activeModel: () => 'provider-reported',
   });
 
@@ -276,6 +311,7 @@ test('resolveSessionModel prefers the recorded session model', async () => {
 
   assert.equal(resolved.model, 'haiku');
   assert.equal(resolved.effort, 'high');
+  assert.equal(resolved.permissionMode, 'acceptEdits');
   assert.equal(resolved.source, 'session');
 });
 

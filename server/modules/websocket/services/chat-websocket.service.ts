@@ -264,13 +264,16 @@ async function dispatchRun(
   const command = typeof data.content === 'string' ? data.content : '';
 
   // Record what this turn runs with so reopening the session later restores the
-  // same model and reasoning effort, and so the resume path has a
-  // session-scoped model answer to use.
+  // same model, reasoning effort and permission mode, and so the resume path
+  // has a session-scoped model answer to use.
   if (typeof clientOptions.model === 'string' && clientOptions.model.trim()) {
     providerModelsService.setSessionModel(provider, sessionId, clientOptions.model);
   }
   if (typeof clientOptions.effort === 'string' && clientOptions.effort.trim()) {
     providerModelsService.setSessionEffort(provider, sessionId, clientOptions.effort);
+  }
+  if (typeof clientOptions.permissionMode === 'string' && clientOptions.permissionMode.trim()) {
+    providerModelsService.setSessionPermissionMode(provider, sessionId, clientOptions.permissionMode);
   }
 
   const attachmentCandidates = [
