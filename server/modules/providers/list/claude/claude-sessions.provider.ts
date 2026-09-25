@@ -29,6 +29,7 @@ import {
 import { sessionsDb } from '@/modules/database/index.js';
 import { summarizeClaudeTokenUsage } from '@/modules/providers/services/provider-token-usage.service.js';
 import { noSessionHistoryTiming } from '@/modules/providers/services/session-history-timing.service.js';
+import { transcriptRowsCache } from '@/modules/providers/services/transcript-rows-cache.service.js';
 
 const PROVIDER = 'claude';
 
@@ -174,6 +175,60 @@ async function readClaudeSubagentTranscript(
   const lastActivity = activity[activity.length - 1];
   transcript.endedMidToolCall = lastActivity?.kind === 'tool' && !lastActivity.toolResult;
 
+  return transcript;
+}
+
+/**
+ * Subagent transcripts already read, keyed by path and valid while the file
+ * keeps the size and mtime it had.
+ *
+ * A session's history read reads every subagent its transcript mentions, and a
+ * finished subagent's file never changes again: a long session re-read 35 of
+ * them, 112 MB, on every read — ~300 ms of each — to rebuild the same cards.
+ * Kept within a file-byte budget, least recently used first out. The result is
+ * shared, so it is never mutated: callers slice and map it.
+ */
+const subagentTranscriptCache = new Map<string, {
+  size: number;
+  mtimeMs: number;
+  transcript: ClaudeSubagentTranscript;
+}>();
+const MAX_CACHED_SUBAGENT_FILE_BYTES = 256 * 1024 * 1024;
+
+async function readClaudeSubagentTranscriptCached(
+  filePath: string,
+  timing: SessionHistoryTiming = noSessionHistoryTiming,
+): Promise<ClaudeSubagentTranscript> {
+  let stat;
+  try {
+    stat = await fsp.stat(filePath);
+  } catch {
+    subagentTranscriptCache.delete(filePath);
+    return readClaudeSubagentTranscript(filePath, timing);
+  }
+
+  const cached = subagentTranscriptCache.get(filePath);
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+    subagentTranscriptCache.delete(filePath);
+    subagentTranscriptCache.set(filePath, cached);
+    timing.count('agentCacheHits', 1);
+    return cached.transcript;
+  }
+
+  const transcript = await readClaudeSubagentTranscript(filePath, timing);
+  subagentTranscriptCache.delete(filePath);
+  subagentTranscriptCache.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs, transcript });
+  let total = 0;
+  for (const entry of subagentTranscriptCache.values()) {
+    total += entry.size;
+  }
+  for (const [key, entry] of subagentTranscriptCache) {
+    if (total <= MAX_CACHED_SUBAGENT_FILE_BYTES || subagentTranscriptCache.size <= 1) {
+      break;
+    }
+    total -= entry.size;
+    subagentTranscriptCache.delete(key);
+  }
   return transcript;
 }
 
@@ -517,11 +572,15 @@ async function getSessionMessages(
 
     const projectDir = path.dirname(jsonLPath);
 
+    // Through the rows cache: a transcript that grew since the last read is
+    // parsed from where that read stopped. Its rows are shared between reads,
+    // so the ones the fold below writes to are copied first.
     const rows = await timing.phase(
       'read',
-      (readTiming) => readTranscriptRows(jsonLPath, providerSessionId, readTiming),
+      (readTiming) => transcriptRowsCache.readRows({ filePath: jsonLPath, sessionId: providerSessionId, timing: readTiming }),
     );
-    const messages = timing.phaseSync('prune', () => dropSupersededPromptBranches(rows));
+    const messages = timing.phaseSync('prune', () => dropSupersededPromptBranches(rows))
+      .map((row) => (row.toolUseResult?.agentId ? structuredClone(row) : row));
 
     const agentIds = new Set<string>();
     for (const message of messages) {
@@ -555,7 +614,7 @@ async function getSessionMessages(
         const [transcript, meta] = await agentsTiming.phase('agentRead', (readTiming) => Promise.all([
           readTiming.phase(
             'agentTranscript',
-            (transcriptTiming) => readClaudeSubagentTranscript(located.transcriptPath, transcriptTiming),
+            (transcriptTiming) => readClaudeSubagentTranscriptCached(located.transcriptPath, transcriptTiming),
           ),
           readTiming.phase('agentMeta', () => readClaudeSubagentMeta(located.metaPath)),
         ]));
