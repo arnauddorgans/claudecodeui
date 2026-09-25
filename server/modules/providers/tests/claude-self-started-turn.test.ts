@@ -236,3 +236,128 @@ test("a subagent's messages after the turn do not open one", async () => {
   uninstall();
   await closeClaudeSDKSession('app-bg-3');
 });
+
+/** A context that also turns a `stream_event` text delta into a `stream_delta` frame. */
+function createStreamingContext(): ProviderRuntimeContext {
+  const base = createContext();
+  return {
+    ...base,
+    normalizeMessage: (raw, sessionId) => {
+      const message = raw as AnyRecord;
+      if (message.type === 'stream_event' && message.event?.delta?.text) {
+        return [{
+          id: 'd', kind: 'stream_delta', content: message.event.delta.text, sessionId: sessionId ?? '', provider: 'claude', timestamp: '',
+        }];
+      }
+      return base.normalizeMessage(raw, sessionId);
+    },
+  };
+}
+
+test('a stream_event with no turn open opens one, and the delta is delivered', async () => {
+  const queries = installFakeSdk();
+  const sent = createWriter();
+  const unprompted = createWriter();
+  let asked = 0;
+  const uninstall = onSelfStartedTurn(() => { asked += 1; return unprompted; });
+
+  await queryClaudeSDK('hello', { sessionId: 'app-bg-4' }, sent, createStreamingContext());
+  const sentAfterItsTurn = sent.frames.length;
+
+  // The reply streams before its full `assistant` message exists.
+  queries[0].emit({
+    type: 'stream_event',
+    session_id: 'sid-bg',
+    event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'first words' } },
+  });
+  await until(() => unprompted.frames.length > 0);
+  assert.equal(asked, 1, 'the first streamed delta opened the turn');
+  assert.equal(getSessionProcess('app-bg-4')?.turnActive, true, 'and the session shows it running while it streams');
+
+  queries[0].emit({
+    type: 'assistant',
+    session_id: 'sid-bg',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 1, output_tokens: 1 } },
+  });
+  queries[0].emit({ type: 'result', subtype: 'success', session_id: 'sid-bg' });
+  await until(() => unprompted.kinds().includes('complete'));
+
+  assert.equal(asked, 1, 'one turn, not one per message');
+  const kinds = unprompted.kinds().filter((kind) => kind !== 'status');
+  assert.deepEqual(kinds, ['stream_delta', 'text', 'complete'], 'the first delta reached the new run, before the rest');
+  assert.equal(unprompted.frames[0].content, 'first words');
+  assert.equal(sent.frames.length, sentAfterItsTurn, 'nothing of it reached the finished run');
+  assert.equal(getSessionProcess('app-bg-4')?.turnActive, false, 'the result ended it');
+
+  uninstall();
+  await closeClaudeSDKSession('app-bg-4');
+});
+
+test('the system init that starts an unprompted turn opens it', async () => {
+  const queries = installFakeSdk();
+  const sent = createWriter();
+  const unprompted = createWriter();
+  let asked = 0;
+  const uninstall = onSelfStartedTurn(() => { asked += 1; return unprompted; });
+
+  await queryClaudeSDK('hello', { sessionId: 'app-bg-5' }, sent, createContext());
+  const sentAfterItsTurn = sent.frames.length;
+
+  // What the CLI emits when a background task reports back and it replies.
+  queries[0].emit({ type: 'system', subtype: 'task_notification', task_id: 't1', status: 'completed', session_id: 'sid-bg' });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(asked, 0, 'the notification itself is bookkeeping');
+
+  queries[0].emit({ type: 'system', subtype: 'init', session_id: 'sid-bg' });
+  await until(() => asked > 0);
+  assert.equal(getSessionProcess('app-bg-5')?.turnActive, true, 'running from the init on, while the model thinks');
+
+  queries[0].emit({ type: 'system', subtype: 'thinking_tokens', session_id: 'sid-bg', tokens: 10 });
+  queries[0].emit({
+    type: 'assistant',
+    session_id: 'sid-bg',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 1, output_tokens: 1 } },
+  });
+  queries[0].emit({ type: 'result', subtype: 'success', session_id: 'sid-bg' });
+  await until(() => unprompted.kinds().includes('complete'));
+
+  assert.equal(asked, 1);
+  assert.ok(unprompted.kinds().includes('text'));
+  assert.equal(unprompted.kinds().filter((kind) => kind === 'complete').length, 1);
+  // The notification's own frame went where it always did; nothing after the init did.
+  assert.ok(sent.frames.length - sentAfterItsTurn <= 1);
+
+  uninstall();
+  await closeClaudeSDKSession('app-bg-5');
+});
+
+test('background bookkeeping between turns opens no turn', async () => {
+  const queries = installFakeSdk();
+  const sent = createWriter();
+  const unprompted = createWriter();
+  let asked = 0;
+  const uninstall = onSelfStartedTurn(() => { asked += 1; return unprompted; });
+
+  await queryClaudeSDK('hello', { sessionId: 'app-bg-6' }, sent, createContext());
+
+  for (const message of [
+    { type: 'system', subtype: 'task_started', task_id: 't1' },
+    { type: 'system', subtype: 'task_progress', task_id: 't1' },
+    { type: 'system', subtype: 'task_updated', task_id: 't1' },
+    { type: 'system', subtype: 'background_tasks_changed' },
+    { type: 'system', subtype: 'hook_started', hook_name: 'Stop' },
+    { type: 'system', subtype: 'session_state_changed', state: 'idle' },
+    { type: 'tool_progress', tool_use_id: 'toolu_bg', tool_name: 'Bash' },
+    { type: 'prompt_suggestion', suggestion: 'next?' },
+    { type: 'result', subtype: 'success' },
+  ]) {
+    queries[0].emit({ ...message, session_id: 'sid-bg' });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal(asked, 0, 'none of it is a turn, and a run opened on it would block the next send');
+  assert.equal(getSessionProcess('app-bg-6')?.turnActive, false);
+
+  uninstall();
+  await closeClaudeSDKSession('app-bg-6');
+});

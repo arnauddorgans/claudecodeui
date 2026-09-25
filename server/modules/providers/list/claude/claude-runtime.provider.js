@@ -1559,15 +1559,38 @@ function captureProviderSessionId(proc, providerSessionId) {
 }
 
 /**
+ * System messages that are the model's turn itself, as opposed to bookkeeping
+ * about the process's background work.
+ */
+const TURN_SYSTEM_SUBTYPES = new Set([
+  'init',
+  'thinking_tokens',
+  'status',
+  'compact_boundary',
+  'api_retry',
+]);
+
+/**
  * True for the first message of a turn of the session's own that no client
  * asked for.
  *
  * The CLI answers more than the prompts it is sent: a background task that
- * finishes makes it inject a `<task-notification>` user record and reply to
- * it, and a hook or a scheduled wake does the same. Those messages are a
- * `user` record and the `assistant` ones that answer it, on the main thread —
- * a subagent's traffic carries `parent_tool_use_id` and belongs to the task
- * that spawned it, not to a turn of the session.
+ * finishes makes it reply to the `<task-notification>` it injects, and a hook
+ * or a scheduled wake does the same. The turn is opened on the *first* message
+ * of that turn, whatever its kind. Waiting for a `user` or `assistant` one was
+ * too late: the injected `user` record is written to the transcript but never
+ * emitted on the stream, and the reply's first `assistant` message only lands
+ * once the model has finished it, so everything before it (`system` `init`,
+ * seconds of `thinking_tokens`, any `stream_event`) went out on the finished
+ * run's writer, and the run itself lasted a millisecond — never seen by a
+ * 1 s poll of the running list, and over before a client could subscribe.
+ *
+ * What does not open a turn: a subagent's traffic (`parent_tool_use_id`, it
+ * belongs to the task that spawned it), and the background bookkeeping the
+ * CLI emits between turns — `task_*`, `background_tasks_changed`, hooks,
+ * `tool_progress`, `result`, `prompt_suggestion`, `session_state_changed`.
+ * A run opened on one of those would stay open until some later `result`,
+ * and while it is open the gateway refuses the user's own `chat.send`.
  * @param {Object} sdkMessage - SDK stream message
  * @returns {boolean} True when the message opens a turn of the session's own
  */
@@ -1575,7 +1598,17 @@ function startsSelfStartedTurn(sdkMessage) {
   if (sdkMessage?.parent_tool_use_id) {
     return false;
   }
-  return sdkMessage?.type === 'user' || sdkMessage?.type === 'assistant';
+  switch (sdkMessage?.type) {
+    case 'user':
+    case 'assistant':
+    case 'stream_event':
+    case 'tool_use_summary':
+      return true;
+    case 'system':
+      return TURN_SYSTEM_SUBTYPES.has(sdkMessage.subtype);
+    default:
+      return false;
+  }
 }
 
 /**
