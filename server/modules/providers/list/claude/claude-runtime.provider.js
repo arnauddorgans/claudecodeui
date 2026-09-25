@@ -68,6 +68,9 @@ const sessionProcesses = new Map();
 const pendingToolApprovals = new Map();
 // Told about every process that starts or ends for an app session.
 const processListeners = new Set();
+// Asked for a writer when a process starts a turn nobody sent; see
+// `openSelfStartedTurn`. The chat gateway installs it at startup.
+let selfStartedTurnOpener = null;
 
 const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEOUT_MS, 10) || 55000;
 
@@ -712,6 +715,21 @@ function emitProcessChange(proc, state) {
 function onSessionProcessChange(listener) {
   processListeners.add(listener);
   return () => processListeners.delete(listener);
+}
+
+/**
+ * Installs what to ask for a writer when a process starts a turn nobody sent.
+ * One installer, the chat gateway's: a turn has one run and one writer.
+ * @param {(sessionId: string) => Object|null} open - Answers with the writer of a run it opened, or null
+ * @returns {() => void} Uninstalls
+ */
+function onSelfStartedTurn(open) {
+  selfStartedTurnOpener = open || null;
+  return () => {
+    if (selfStartedTurnOpener === open) {
+      selfStartedTurnOpener = null;
+    }
+  };
 }
 
 /**
@@ -1540,7 +1558,70 @@ function captureProviderSessionId(proc, providerSessionId) {
   }
 }
 
+/**
+ * True for the first message of a turn of the session's own that no client
+ * asked for.
+ *
+ * The CLI answers more than the prompts it is sent: a background task that
+ * finishes makes it inject a `<task-notification>` user record and reply to
+ * it, and a hook or a scheduled wake does the same. Those messages are a
+ * `user` record and the `assistant` ones that answer it, on the main thread —
+ * a subagent's traffic carries `parent_tool_use_id` and belongs to the task
+ * that spawned it, not to a turn of the session.
+ * @param {Object} sdkMessage - SDK stream message
+ * @returns {boolean} True when the message opens a turn of the session's own
+ */
+function startsSelfStartedTurn(sdkMessage) {
+  if (sdkMessage?.parent_tool_use_id) {
+    return false;
+  }
+  return sdkMessage?.type === 'user' || sdkMessage?.type === 'assistant';
+}
+
+/**
+ * Opens a turn for a reply nobody asked for, so it is delivered like any other.
+ *
+ * Without this the turn went out on the *previous* turn's writer: its frames
+ * carried the finished run's `seq`, reached only the sockets that had watched
+ * that run and were still open, the session never showed as running, and no
+ * `complete` ever ended it — so a client that had merely subscribed saw
+ * nothing until it refetched history, and the push bridge, which watches the
+ * running list, never learned there was an answer to announce (docs/PLAN.md §3).
+ * @param {Object} proc - Session process
+ */
+function openSelfStartedTurn(proc) {
+  const sessionId = appSessionIdOf(proc);
+  const writer = sessionId ? selfStartedTurnOpener?.(sessionId) : null;
+  if (!writer) {
+    return;
+  }
+
+  proc.writer = writer;
+  let finish;
+  const done = new Promise((resolve) => { finish = resolve; });
+  proc.turn = {
+    done,
+    finish,
+    aborted: false,
+    completeSent: false,
+    assistantBudgetSent: false,
+    backgroundWork: false,
+    // Nobody is waiting on `done`: the turn announces its own end instead.
+    selfStarted: true,
+  };
+  clearActivity(proc);
+  console.log('Turn started by the CLI itself for session:', sessionId);
+  emitProcessChange(proc, 'chat');
+}
+
 function handleProcessMessage(proc, message) {
+  // A message with no turn to belong to is the CLI answering something nobody
+  // sent. Opened before anything is routed, so the whole turn — its first
+  // message included — goes out on the run that was opened for it.
+  if (!proc.turn && !proc.closing && startsSelfStartedTurn(message)) {
+    openSelfStartedTurn(proc);
+  }
+
   const turn = proc.turn;
   const writer = proc.writer;
   const sid = eventSessionIdOf(proc);
@@ -1614,8 +1695,10 @@ function handleProcessMessage(proc, message) {
   if (turn) {
     endTurn(proc, turn, {});
   } else {
-    // A result with no turn open is background work reporting back through a
-    // follow-up turn the CLI ran on its own.
+    // A result with still no turn open: the CLI ran a follow-up turn of its
+    // own and nothing could be opened for it (no gateway installed, or the
+    // session already had a run). Only the background-work notification then,
+    // as before the turn was announced at all.
     notifyBackgroundWorkCompleted({
       userId: proc.userId,
       provider: 'claude',
@@ -1707,6 +1790,13 @@ function endTurn(proc, turn, outcome) {
       sessionName: proc.sessionSummary,
       stopReason: turn.aborted ? 'aborted' : 'completed'
     });
+  }
+
+  // A client turn ends for its sender when `run` resolves; a turn the CLI
+  // started has no sender, so the only word on `turnActive` going back to
+  // false is this one.
+  if (turn.selfStarted && !proc.closing) {
+    emitProcessChange(proc, 'chat');
   }
 
   turn.finish();
@@ -1904,6 +1994,7 @@ export const claudeRuntime = {
     get: getSessionProcess,
     list: listSessionProcesses,
     onChange: onSessionProcessChange,
+    onSelfStartedTurn,
     closeAll: closeAllClaudeSDKSessions,
   },
   permissions: {
@@ -1923,6 +2014,7 @@ export {
   getSessionProcess,
   listSessionProcesses,
   onSessionProcessChange,
+  onSelfStartedTurn,
   resolveToolApproval,
   getPendingApprovalsForSession,
   extractTokenBudget,

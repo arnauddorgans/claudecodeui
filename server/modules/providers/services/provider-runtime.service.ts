@@ -157,6 +157,21 @@ export function createProviderRuntimeService(
       };
     },
 
+    /**
+     * Installs, on every provider that keeps processes, what to ask for a
+     * writer when one of them starts a turn nobody sent; returns the uninstall.
+     */
+    onSelfStartedTurn(open: (sessionId: string) => ProviderRuntimeWriter | null): () => void {
+      const uninstalls = dependencies.listProviders().map(
+        (provider) => provider.runtime.processes?.onSelfStartedTurn?.(open) ?? (() => {}),
+      );
+      return () => {
+        for (const uninstall of uninstalls) {
+          uninstall();
+        }
+      };
+    },
+
     /** Ends every process every provider keeps, for the server's shutdown. */
     async closeAllSessionProcesses(): Promise<void> {
       await Promise.all(

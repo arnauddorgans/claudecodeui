@@ -2,7 +2,7 @@ import type { Server as HttpServer } from 'node:http';
 
 import { WebSocket, WebSocketServer, type VerifyClientCallbackSync } from 'ws';
 
-import { handleChatConnection } from '@/modules/websocket/services/chat-websocket.service.js';
+import { handleChatConnection, startSelfStartedRun } from '@/modules/websocket/services/chat-websocket.service.js';
 import { startSessionProcessBroadcast } from '@/modules/websocket/services/session-process-broadcast.service.js';
 import { verifyWebSocketClient } from '@/modules/websocket/services/websocket-auth.service.js';
 import { handlePluginWsProxy } from '@/modules/websocket/services/plugin-websocket-proxy.service.js';
@@ -93,6 +93,9 @@ export function createWebSocketServer(
   });
 
   startSessionProcessBroadcast(dependencies.chat.runtime);
+  // A turn the CLI starts by itself gets a run of its own, so it is delivered
+  // and announced like a turn a client sent (docs/PLAN.md §3).
+  dependencies.chat.runtime.onSelfStartedTurn?.(startSelfStartedRun);
 
   wss.on('connection', (ws, request) => {
     attachWebSocketHeartbeat(ws);

@@ -83,6 +83,11 @@ export type ProviderRuntimeGateway = {
   stopTask(provider: LLMProvider, sessionId: string, taskId: string): Promise<boolean>;
   getSessionProcess(sessionId: string): SessionProcessSnapshot | null;
   onSessionProcessChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
+  /**
+   * Installs what a provider asks for a writer when its process starts a turn
+   * nobody sent. Absent for providers that keep no process between turns.
+   */
+  onSelfStartedTurn?(open: (sessionId: string) => ProviderRuntimeWriter | null): () => void;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
 };
@@ -593,6 +598,11 @@ function handleChatSubscribe(
     const run = chatRunRegistry.getRun(sessionId);
     const isProcessing = chatRunRegistry.isProcessing(sessionId);
 
+    // Asking once is asking for the session, not for the run that happens to
+    // be going: the next one — a turn the session's own process starts
+    // included — finds this socket in its audience from the start.
+    chatRunRegistry.watchSession(sessionId, ws);
+
     // Future live events for this run should land on the socket that asked —
     // this is what makes mid-stream page refreshes work for all providers.
     if (isProcessing) {
@@ -724,6 +734,41 @@ export async function runDetachedChatTurn(
   );
 }
 
+/**
+ * Opens a run for a turn a session's own process started, and hands back the
+ * writer for it.
+ *
+ * Installed on every provider that keeps a process between turns
+ * (`onSelfStartedTurn`). Registering the run is the whole point: it is what
+ * puts the session in `/providers/sessions/running`, what makes
+ * `chat_subscribed` say the session is processing, what gives the turn's
+ * frames a `seq` of their own and a replay buffer, and what carries the
+ * terminal `complete` at the end — the signal the push bridge turns into
+ * "Claude replied" (docs/PLAN.md §3).
+ *
+ * Null when there is nothing to open a run for: an unknown session, or one
+ * already running (a client's turn wins; the provider then reports the turn
+ * the way it did before, unannounced).
+ */
+export function startSelfStartedRun(sessionId: string): ProviderRuntimeWriter | null {
+  const session = sessionsDb.getSessionById(sessionId);
+  if (!session) {
+    return null;
+  }
+
+  const run = chatRunRegistry.startRun({
+    appSessionId: sessionId,
+    provider: session.provider as LLMProvider,
+    providerSessionId: session.provider_session_id,
+    // Nobody sent this turn, so there is no socket of its own: the run's
+    // audience is whoever already watches the session.
+    connection: null,
+    userId: null,
+  });
+
+  return run ? (run.writer as ProviderRuntimeWriter) : null;
+}
+
 export function handleChatConnection(
   ws: WebSocket,
   request: AuthenticatedWebSocketRequest,
@@ -780,5 +825,6 @@ export function handleChatConnection(
   ws.on('close', () => {
     console.log('[INFO] Chat client disconnected');
     connectedClients.delete(ws);
+    chatRunRegistry.forgetConnection(ws);
   });
 }

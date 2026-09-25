@@ -673,6 +673,14 @@ export type ProviderRuntimeProcessGateway = {
   list(): SessionProcessSnapshot[];
   /** Called with a snapshot whenever a process starts or ends; returns the unsubscribe. */
   onChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
+  /**
+   * Installs what the runtime asks for a writer when its process starts a turn
+   * nobody sent — a background task reporting back, a hook, a scheduled wake.
+   * The answer is the gateway's writer for a run it registered for that turn,
+   * or null when it refuses (no such session, one already running), in which
+   * case the turn stays unannounced as before. Returns the uninstall.
+   */
+  onSelfStartedTurn?(open: (sessionId: string) => ProviderRuntimeWriter | null): () => void;
   closeAll(): Promise<void>;
 };
 
