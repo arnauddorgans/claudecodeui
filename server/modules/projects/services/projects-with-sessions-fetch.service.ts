@@ -3,8 +3,7 @@ import path from 'node:path';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { sessionSynchronizerService } from '@/modules/providers/index.js';
-import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
-import type { RealtimeClientConnection } from '@/shared/types.js';
+import { getRealtimeClient } from '@/modules/websocket/index.js';
 import { AppError } from '@/shared/utils.js';
 
 type SessionSummary = {
@@ -51,6 +50,13 @@ type GetProjectsWithSessionsOptions = {
   skipSynchronization?: boolean;
   sessionsLimit?: number;
   sessionsOffset?: number;
+  /**
+   * The chat socket of the client that asked (`/ws?clientId=`), which alone
+   * receives this fetch's `loading_progress`. Absent: no progress frames.
+   */
+  progressClientId?: string | null;
+  /** Aborted when the requester went away: the fetch stops, silently. */
+  signal?: AbortSignal;
 };
 
 type SessionPaginationOptions = {
@@ -159,18 +165,48 @@ function readProjectSessionsPageByPath(
   };
 }
 
-// Broadcast progress to all connected WebSocket clients.
-// Uses the unified `kind` envelope like every other websocket frame.
-function broadcastProgress(progress: ProgressUpdate) {
-  const message = JSON.stringify({
+/**
+ * Sends one fetch's progress to the client that asked for it, and to no one
+ * else.
+ *
+ * It used to go to every connected socket, so each client that (re)loaded its
+ * project list sent one frame per project to all the others: with a web UI
+ * reconnecting in a loop, a client that had only subscribed to one session
+ * received ~350 `loading_progress` frames a second, and each of them re-rendered
+ * every other web UI's sidebar. Uses the unified `kind` envelope like every
+ * other websocket frame.
+ */
+function sendProgress(progressClientId: string | null | undefined, progress: ProgressUpdate) {
+  const client = getRealtimeClient(progressClientId);
+  if (!client) {
+    return;
+  }
+  client.send(JSON.stringify({
     kind: 'loading_progress',
     ...progress,
-  });
+  }));
+}
 
-  connectedClients.forEach((client: RealtimeClientConnection) => {
-    if (client.readyState === WS_OPEN_STATE) {
-      client.send(message);
-    }
+/**
+ * Waits for `work` unless the requester leaves first. The work itself is not
+ * cancelled — the session scan is shared by every caller and advances the
+ * scan cursor — but an abandoned request stops waiting for it and does
+ * nothing more.
+ */
+function unlessAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T | null> {
+  if (!signal) {
+    return work;
+  }
+  if (signal.aborted) {
+    return Promise.resolve(null);
+  }
+  return new Promise<T | null>((resolve, reject) => {
+    const onAbort = () => resolve(null);
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (error) => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
   });
 }
 
@@ -180,8 +216,12 @@ function broadcastProgress(progress: ProgressUpdate) {
 export async function getProjectsWithSessions(
   options: GetProjectsWithSessionsOptions = {}
 ): Promise<ProjectListItem[]> {
+  const { signal, progressClientId } = options;
   if (!options.skipSynchronization) {
-    await sessionSynchronizerService.synchronizeSessions();
+    await unlessAborted(sessionSynchronizerService.synchronizeSessions(), signal);
+  }
+  if (signal?.aborted) {
+    return [];
   }
 
   const projectRows = projectsDb.getProjectPaths() as Array<{
@@ -195,12 +235,15 @@ export async function getProjectsWithSessions(
   let processedProjects = 0;
 
   for (const row of projectRows) {
+    if (signal?.aborted) {
+      return [];
+    }
     processedProjects += 1;
 
     const projectId = row.project_id;
     const projectPath = row.project_path;
 
-    broadcastProgress({
+    sendProgress(progressClientId, {
       phase: 'loading',
       current: processedProjects,
       total: totalProjects,
@@ -231,7 +274,7 @@ export async function getProjectsWithSessions(
     });
   }
 
-  broadcastProgress({
+  sendProgress(progressClientId, {
     phase: 'complete',
     current: totalProjects,
     total: totalProjects,

@@ -7,6 +7,7 @@ import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/utils
 import { getArchivedProjectsWithSessions, getProjectSessionsPage, getProjectsWithSessions } from '@/modules/projects/services/projects-with-sessions-fetch.service.js';
 import { deleteOrArchiveProject, restoreArchivedProject } from '@/modules/projects/services/project-delete.service.js';
 import { applyLegacyStarredProjectIds, toggleProjectStar } from '@/modules/projects/services/project-star.service.js';
+import { readRealtimeClientId } from '@/modules/websocket/index.js';
 
 const router = express.Router();
 
@@ -73,11 +74,24 @@ router.get(
       readQueryStringValue(req.query.skipSync).trim() === '1';
     const sessionsLimit = readOptionalNumericQueryValue(req.query.sessionsLimit) ?? undefined;
     const sessionsOffset = readOptionalNumericQueryValue(req.query.sessionsOffset) ?? undefined;
+    // A client that leaves mid-fetch (a reconnecting UI does, many times a
+    // second) must not leave its fetch running on its behalf.
+    const abandoned = new AbortController();
+    res.on('close', () => {
+      if (!res.writableFinished) {
+        abandoned.abort();
+      }
+    });
     const projects = await getProjectsWithSessions({
       skipSynchronization,
       sessionsLimit,
       sessionsOffset,
+      progressClientId: readRealtimeClientId(readQueryStringValue(req.query.progressClientId)),
+      signal: abandoned.signal,
     });
+    if (abandoned.signal.aborted) {
+      return;
+    }
     res.json(projects);
   }),
 );

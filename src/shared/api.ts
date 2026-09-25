@@ -4,6 +4,7 @@ import {
   storeAuthToken,
 } from '@/shared/authToken';
 import { IS_PLATFORM } from '@/shared/utils';
+import { REALTIME_CLIENT_ID } from '@/shared/realtimeClientId';
 import { readVoiceConfig, voiceConfigHeaders } from '@/shared/voiceConfig';
 
 // Headers are a plain record rather than the full `HeadersInit` union so the
@@ -178,7 +179,8 @@ export const api = {
   // config endpoint removed - no longer needed (frontend uses window.location)
   // After the projectName → projectId migration the path/query identifier is
   // the DB-assigned `projectId`; parameter names reflect that for clarity.
-  projects: () => get('/api/projects'),
+  // Names this tab so the list's `loading_progress` comes back to it alone.
+  projects: () => get(`/api/projects${query({ progressClientId: REALTIME_CLIENT_ID })}`),
   archivedProjects: () => get('/api/projects/archived'),
   projectSessions: (
     projectId: string,

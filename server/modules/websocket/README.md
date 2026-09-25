@@ -257,10 +257,15 @@ Only chat sockets (`/ws`) are tracked in `connectedClients`.
 
 That shared set is consumed by:
 
-1. `modules/projects/services/projects-with-sessions-fetch.service.ts`
-Broadcasts `kind: loading_progress` while project snapshots are being built.
-2. `modules/providers/services/sessions-watcher.service.ts`
+1. `modules/providers/services/sessions-watcher.service.ts`
 Broadcasts per-session `kind: session_upserted` deltas when provider session artifacts change (no full project snapshots).
+
+`kind: loading_progress` is *not* a broadcast: it goes only to the client whose `GET /api/projects` it
+describes. A client names itself on both transports — `/ws?clientId=<id>` and
+`GET /api/projects?progressClientId=<id>` — and `getRealtimeClient(id)` finds its socket; a request that names
+no open socket gets no progress frames. Broadcasting it made every client's list reload fan out one frame per
+project to every other client (~350 frames/s during a reconnect storm). A request whose client goes away
+mid-fetch is aborted and emits nothing more.
 
 This design centralizes cross-module realtime fanout without requiring route-local references to WebSocket internals.
 

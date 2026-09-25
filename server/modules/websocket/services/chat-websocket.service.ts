@@ -7,7 +7,13 @@ import { providerModelsService, sessionsService } from '@/modules/providers/inde
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
 import { sessionProcessRegistry } from '@/modules/websocket/services/session-process-registry.service.js';
 import { closeTerminalSession } from '@/modules/websocket/services/shell-websocket.service.js';
-import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
+import {
+  connectedClients,
+  forgetRealtimeClient,
+  readRealtimeClientId,
+  registerRealtimeClientId,
+  WS_OPEN_STATE,
+} from '@/modules/websocket/services/websocket-state.service.js';
 import {
   getGlobalImageAssetsDir,
   isImageAttachmentDescriptor,
@@ -777,6 +783,15 @@ export function handleChatConnection(
   console.log('[INFO] Chat WebSocket connected');
   connectedClients.add(ws);
 
+  // The id this client gives itself, so a frame about its own request can be
+  // sent to it alone (`getRealtimeClient`).
+  const clientId = readRealtimeClientId(
+    new URL(request.url ?? '/', 'http://localhost').searchParams.get('clientId'),
+  );
+  if (clientId) {
+    registerRealtimeClientId(ws, clientId);
+  }
+
   const userId = readRequestUserId(request);
 
   ws.on('message', async (rawMessage) => {
@@ -825,6 +840,7 @@ export function handleChatConnection(
   ws.on('close', () => {
     console.log('[INFO] Chat client disconnected');
     connectedClients.delete(ws);
+    forgetRealtimeClient(ws);
     chatRunRegistry.forgetConnection(ws);
   });
 }

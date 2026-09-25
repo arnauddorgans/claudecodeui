@@ -1,4 +1,11 @@
-export { WS_OPEN_STATE, connectedClients } from './services/websocket-state.service.js';
+export {
+  WS_OPEN_STATE,
+  connectedClients,
+  forgetRealtimeClient,
+  getRealtimeClient,
+  readRealtimeClientId,
+  registerRealtimeClientId,
+} from './services/websocket-state.service.js';
 export { createWebSocketServer } from './services/websocket-server.service.js';
 export { chatRunRegistry } from './services/chat-run-registry.service.js';
 // Consumed by the providers module's sessions watcher, which announces the
