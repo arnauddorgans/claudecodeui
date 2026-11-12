@@ -1,11 +1,12 @@
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import type { IProviderAuth } from '@/shared/interfaces.js';
 import type { CliVersionProbe, ProviderAuthStatus, ProviderAuthSubscriptionOverride } from '@/shared/types.js';
-import { probeCliVersion, readObjectRecord, readOptionalString } from '@/shared/utils.js';
+import { getClaudeConfigDirectory, probeCliVersion, readObjectRecord, readOptionalString } from '@/shared/utils.js';
 
 type ClaudeCredentialsStatus = {
   authenticated: boolean;
@@ -28,7 +29,37 @@ const hasErrorCode = (error: unknown, code: string): boolean => (
   error instanceof Error && 'code' in error && error.code === code
 );
 
+/** Reads one generic-password secret by service name, or `null` when there is none. */
+type KeychainSecretReader = (service: string) => Promise<string | null>;
+
+/**
+ * The macOS keychain item Claude Code stores its `claude /login` session in
+ * instead of `.credentials.json`: `Claude Code-credentials`, suffixed with the
+ * first 8 hex chars of the SHA-256 of `CLAUDE_CONFIG_DIR` when that is set.
+ */
+const claudeKeychainServiceName = (): string => {
+  const configDirectory = process.env.CLAUDE_CONFIG_DIR?.trim();
+  const suffix = configDirectory && path.isAbsolute(configDirectory)
+    ? `-${createHash('sha256').update(configDirectory).digest('hex').slice(0, 8)}`
+    : '';
+  return `Claude Code-credentials${suffix}`;
+};
+
+/** Asks `security` for the item; always `null` off macOS. */
+const readMacKeychainSecret: KeychainSecretReader = (service) => {
+  if (process.platform !== 'darwin') {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    execFile('security', ['find-generic-password', '-s', service, '-w'], { timeout: 5000 }, (error, stdout) => {
+      resolve(error ? null : stdout.trim() || null);
+    });
+  });
+};
+
 export class ClaudeProviderAuth implements IProviderAuth {
+  constructor(private readonly readKeychainSecret: KeychainSecretReader = readMacKeychainSecret) {}
+
   /**
    * Checks whether the Claude Code CLI that chats run is available on this
    * host, and which version it is.
@@ -80,7 +111,7 @@ export class ClaudeProviderAuth implements IProviderAuth {
    */
   private async loadSettingsEnv(): Promise<Record<string, unknown>> {
     try {
-      const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+      const settingsPath = path.join(getClaudeConfigDirectory(), 'settings.json');
       const content = await readFile(settingsPath, 'utf8');
       const settings = readObjectRecord(JSON.parse(content));
       return readObjectRecord(settings?.env) ?? {};
@@ -152,16 +183,36 @@ export class ClaudeProviderAuth implements IProviderAuth {
   }
 
   /**
-   * Reads the `claude /login` OAuth session from ~/.claude/.credentials.json and
-   * reports whether it is still usable. Shared by the fallback path (when no
-   * env credential exists) and by the API-key path (to detect a bypassed login).
+   * The stored login as text: the credentials file, or the keychain item when
+   * there is no file. Any other file error is rethrown unchanged.
+   */
+  private async readStoredCredentials(credPath: string): Promise<string> {
+    try {
+      return await readFile(credPath, 'utf8');
+    } catch (fileError) {
+      const keychainContent = hasErrorCode(fileError, 'ENOENT')
+        ? await this.readKeychainSecret(claudeKeychainServiceName())
+        : null;
+      if (keychainContent) {
+        return keychainContent;
+      }
+      throw fileError;
+    }
+  }
+
+  /**
+   * Reads the `claude /login` OAuth session from `.credentials.json` in the
+   * Claude config directory, or from the macOS keychain item when the file is
+   * absent (the CLI's default storage there), and reports whether it is still
+   * usable. Shared by the fallback path (when no env credential exists) and by
+   * the API-key path (to detect a bypassed login).
    */
   private async readCredentialsFile(): Promise<ClaudeCredentialsStatus> {
     const missingCredentialsError = 'Claude CLI is not authenticated. Run claude /login or configure ANTHROPIC_API_KEY.';
 
     try {
-      const credPath = path.join(os.homedir(), '.claude', '.credentials.json');
-      const content = await readFile(credPath, 'utf8');
+      const credPath = path.join(getClaudeConfigDirectory(), '.credentials.json');
+      const content = await this.readStoredCredentials(credPath);
       const creds = readObjectRecord(JSON.parse(content)) ?? {};
       const oauth = readObjectRecord(creds.claudeAiOauth);
       const accessToken = readOptionalString(oauth?.accessToken);
