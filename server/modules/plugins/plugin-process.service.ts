@@ -21,14 +21,22 @@ const startingPlugins = new Map();
  * site-packages and fails to import; SystemRoot, PATHEXT and TEMP are needed to
  * resolve system DLLs, executable extensions and a temp directory. None of
  * these carry secrets, so the ones that are set get passed straight through.
+ * Exported only for this module's tests.
  */
-function buildPluginEnv(name) {
+export function buildPluginEnv(name) {
   const env = {
     PATH: process.env.PATH,
     HOME: process.env.HOME,
     NODE_ENV: process.env.NODE_ENV || 'production',
     PLUGIN_NAME: name,
   };
+
+  // Not a secret: it tells a plugin which Claude config directory (transcripts,
+  // sessions registry, settings) this instance serves, so it reads the same
+  // files the server does instead of guessing ~/.claude.
+  if (process.env.CLAUDE_CONFIG_DIR) {
+    env.CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
+  }
 
   if (process.platform === 'win32') {
     const WINDOWS_ESSENTIALS = [

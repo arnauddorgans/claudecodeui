@@ -31,7 +31,7 @@ async function executeCustomCommand(
         return template;
       },
     } as unknown as typeof import('node:fs/promises'),
-    homeDirectory: () => '/home/test',
+    claudeConfigDirectory: () => '/home/test/.claude',
     appRoot: '/app',
     // Custom commands never consult the model catalog.
     models: {} as never,

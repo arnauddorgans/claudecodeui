@@ -236,11 +236,17 @@ async function withClaudeCliRegistry(
   }
 
   const realHomedir = os.homedir;
+  const realConfigDir = process.env.CLAUDE_CONFIG_DIR;
   (os as unknown as { homedir: () => string }).homedir = () => homeDirectory;
+  // The registry lives under CLAUDE_CONFIG_DIR when it is set.
+  delete process.env.CLAUDE_CONFIG_DIR;
   try {
     await runTest();
   } finally {
     (os as unknown as { homedir: () => string }).homedir = realHomedir;
+    if (realConfigDir !== undefined) {
+      process.env.CLAUDE_CONFIG_DIR = realConfigDir;
+    }
     await rm(homeDirectory, { recursive: true, force: true });
   }
 }

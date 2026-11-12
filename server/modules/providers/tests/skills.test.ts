@@ -8,9 +8,15 @@ import { providerSkillsService } from '@/modules/providers/services/skills.servi
 
 const patchHomeDir = (nextHomeDir: string) => {
   const original = os.homedir;
+  const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
   (os as any).homedir = () => nextHomeDir;
+  // Claude's skills live under CLAUDE_CONFIG_DIR when it is set.
+  delete process.env.CLAUDE_CONFIG_DIR;
   return () => {
     (os as any).homedir = original;
+    if (originalConfigDir !== undefined) {
+      process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    }
   };
 };
 

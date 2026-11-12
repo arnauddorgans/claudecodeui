@@ -1,6 +1,7 @@
 import fsp from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
+
+import { getClaudeConfigDirectory } from '@/shared/utils.js';
 
 /**
  * One Claude CLI process that is currently producing a response.
@@ -17,7 +18,7 @@ type LiveClaudeCliSession = {
  * Claude Code keeps one file per running session here, named `<pid>.json`.
  * The directory belongs to the CLI, not to CloudCLI: it is only ever read.
  */
-const registryDirectory = () => path.join(os.homedir(), '.claude', 'sessions');
+const registryDirectory = () => path.join(getClaudeConfigDirectory(), 'sessions');
 
 /**
  * Upper bound on registry files inspected per poll.

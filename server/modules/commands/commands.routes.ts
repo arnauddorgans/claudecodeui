@@ -7,7 +7,8 @@ import { parseFrontMatter } from "../../shared/frontmatter.js";
 
 type CommandsRouterDependencies = {
   fileSystem: typeof import('node:fs/promises');
-  homeDirectory(): string;
+  /** Claude Code's config directory; user commands live in its `commands/`. */
+  claudeConfigDirectory(): string;
   appRoot: string;
   models: typeof import('../providers/index.js').providerModelsService;
   runtime: {
@@ -39,7 +40,6 @@ function substituteCommandArguments(template: string, argumentsText: string, arg
 /** Creates Commands routes around explicit filesystem, model-catalog, and runtime adapters. */
 export function createCommandsRouter(dependencies: CommandsRouterDependencies): express.Router {
 const fs = dependencies.fileSystem;
-const os = { homedir: dependencies.homeDirectory };
 const APP_ROOT = dependencies.appRoot;
 const providerModelsService = dependencies.models;
 const process = dependencies.runtime;
@@ -476,9 +476,8 @@ router.post("/list", async (req, res) => {
       allCommands.push(...projectCommands);
     }
 
-    // Scan user-level commands (~/.claude/commands/)
-    const homeDir = os.homedir();
-    const userCommandsDir = path.join(homeDir, ".claude", "commands");
+    // Scan user-level commands (<claude config dir>/commands/)
+    const userCommandsDir = path.join(dependencies.claudeConfigDirectory(), "commands");
     const userCommands = await scanCommandsDirectory(
       userCommandsDir,
       userCommandsDir,
@@ -564,7 +563,7 @@ router.post("/execute", async (req, res) => {
     {
       const resolvedPath = path.resolve(commandPath);
       const userBase = path.resolve(
-        path.join(os.homedir(), ".claude", "commands"),
+        path.join(dependencies.claudeConfigDirectory(), "commands"),
       );
       const projectBase = context?.projectPath
         ? path.resolve(path.join(context.projectPath, ".claude", "commands"))

@@ -1,8 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
-import { readObjectRecord, readStringArray } from '@/shared/utils.js';
+import { getClaudeConfigDirectory, readObjectRecord, readStringArray } from '@/shared/utils.js';
 
 /**
  * The permission rules one Claude settings file contributes.
@@ -27,13 +26,7 @@ type ClaudeSettingsPermissionSource = {
  * that is set, and the server forwards its whole env to every CLI it spawns,
  * so the same override has to apply here.
  */
-const userSettingsPath = (): string => {
-  const configDirectory = process.env.CLAUDE_CONFIG_DIR?.trim();
-  const baseDirectory = configDirectory && path.isAbsolute(configDirectory)
-    ? configDirectory
-    : path.join(os.homedir(), '.claude');
-  return path.join(baseDirectory, 'settings.json');
-};
+const userSettingsPath = (): string => path.join(getClaudeConfigDirectory(), 'settings.json');
 
 /** The administrator-managed settings file, at the fixed path the CLI uses per OS. */
 const managedSettingsPath = (): string => {

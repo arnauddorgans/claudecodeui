@@ -14,7 +14,6 @@
 
 import crypto from 'crypto';
 import { promises as fs } from 'fs';
-import os from 'os';
 import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
@@ -43,7 +42,7 @@ import {
   getReportedClaudeContextWindow,
   rememberClaudeContextWindow
 } from '@/modules/providers/services/provider-token-usage.service.js';
-import { createCompleteMessage, createNormalizedMessage, errorMessage } from '@/shared/utils.js';
+import { createCompleteMessage, createNormalizedMessage, errorMessage, getClaudeGlobalConfigPath } from '@/shared/utils.js';
 import type {
   AnyRecord,
   BackgroundTaskSummary,
@@ -1091,7 +1090,7 @@ function createHeldPromptStream(messages: unknown[]) {
  */
 async function loadMcpConfig(cwd: string | undefined): Promise<AnyRecord | null> {
   try {
-    const claudeConfigPath = path.join(os.homedir(), '.claude.json');
+    const claudeConfigPath = getClaudeGlobalConfigPath();
 
     // Check if config file exists
     try {

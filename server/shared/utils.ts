@@ -44,6 +44,38 @@ import type {
 export const IS_PLATFORM = process.env.VITE_IS_PLATFORM === 'true';
 
 // ---------------------------
+//----------------- CLAUDE CONFIG LOCATION UTILITIES ------------
+/**
+ * Claude Code's config directory: `CLAUDE_CONFIG_DIR` when it is set to an
+ * absolute path, `~/.claude` otherwise. The server forwards its env to every
+ * CLI it spawns, so anything it reads that the CLI writes (transcripts,
+ * `history.jsonl`, the `sessions/` registry, settings, credentials, skills,
+ * commands) has to be looked up here. Read on every call, never cached, so a
+ * test or a late env load is honoured. Used by the Claude providers, the
+ * sessions watcher, the CLI liveness probe, commands, TaskMaster and the file
+ * API's read-only roots.
+ */
+export function getClaudeConfigDirectory(): string {
+  const configDirectory = process.env.CLAUDE_CONFIG_DIR?.trim();
+  return configDirectory && path.isAbsolute(configDirectory)
+    ? configDirectory
+    : path.join(os.homedir(), '.claude');
+}
+
+/**
+ * Claude Code's global config file (user MCP servers, per-project state):
+ * `.claude.json` inside the config directory when `CLAUDE_CONFIG_DIR` is set,
+ * `~/.claude.json` otherwise, which is where the CLI keeps it. Used by the
+ * Claude MCP and runtime providers and by TaskMaster detection.
+ */
+export function getClaudeGlobalConfigPath(): string {
+  const configDirectory = process.env.CLAUDE_CONFIG_DIR?.trim();
+  return configDirectory && path.isAbsolute(configDirectory)
+    ? path.join(configDirectory, '.claude.json')
+    : path.join(os.homedir(), '.claude.json');
+}
+
+// ---------------------------
 //----------------- NORMALIZED MESSAGE HELPER INPUT TYPES ------------
 /**
  * Input payload accepted by `createNormalizedMessage`.
@@ -246,7 +278,7 @@ export const FORBIDDEN_WORKSPACE_PATHS = [
 const READ_ONLY_ROOTS = [...new Set([
   '/tmp',
   os.tmpdir(),
-  path.join(os.homedir(), '.claude', 'projects'),
+  path.join(getClaudeConfigDirectory(), 'projects'),
 ])];
 
 /**

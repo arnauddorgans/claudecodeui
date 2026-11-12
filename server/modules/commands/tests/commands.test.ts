@@ -47,7 +47,7 @@ async function executeCommand(
     fileSystem: {
       readFile: async () => JSON.stringify({ name: 'claude-code-ui', version: '0.0.0-test' }),
     } as unknown as typeof import('node:fs/promises'),
-    homeDirectory: () => '/home/test',
+    claudeConfigDirectory: () => '/home/test/.claude',
     appRoot: '/app',
     models: createModelsService(sessionModels) as never,
     runtime: {

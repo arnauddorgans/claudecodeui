@@ -23,6 +23,8 @@ const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = fixtureHome;
 process.env.USERPROFILE = fixtureHome;
+const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+delete process.env.CLAUDE_CONFIG_DIR;
 
 const { resolvePathUnderRoots, resolveReadOnlyRootPath, validateWorkspacePath } = await import('@/shared/utils.js');
 
@@ -36,6 +38,9 @@ after(async () => {
     delete process.env.USERPROFILE;
   } else {
     process.env.USERPROFILE = previousUserProfile;
+  }
+  if (previousConfigDir !== undefined) {
+    process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
   }
   await rm(fixtureRoot, { recursive: true, force: true });
 });
