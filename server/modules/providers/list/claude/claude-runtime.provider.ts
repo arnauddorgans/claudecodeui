@@ -1526,6 +1526,9 @@ async function runClaudeQuery(
   // The client is told the turn is over as soon as `result` lands, even though
   // the process lingers, so the UI never waits out the idle hold.
   let turnCompleteSent = false;
+  // The last turn of a persistent process was interrupted by the user, and no
+  // turn has opened since: the CLI may still end it with an error result.
+  let lastTurnInterrupted = false;
   // Set when a turn starts background work, cleared when the next `result`
   // arrives — only turns with work still outstanding hold their process open.
   let backgroundWorkPending = false;
@@ -1973,6 +1976,7 @@ async function runClaudeQuery(
           sessionSummary = nextOptions.sessionSummary;
         }
         turnCompleteSent = false;
+        lastTurnInterrupted = false;
         selfStartedTurn = false;
         activity.clear();
         record.activity = undefined;
@@ -2002,6 +2006,7 @@ async function runClaudeQuery(
           return Boolean(abortedTurn.finish);
         }
         abortedSessionIds.add(key);
+        lastTurnInterrupted = true;
         let settleAbort: () => void = () => {};
         abortSettled = new Promise<void>((resolve) => { settleAbort = resolve; });
         const settleTimer = setTimeout(() => abortedTurn.finish?.(), ABORT_SETTLE_MS);
@@ -2032,6 +2037,7 @@ async function runClaudeQuery(
           abortedTurn.finish = null;
           clearTimeout(settleTimer);
           abortedSessionIds.delete(key);
+          lastTurnInterrupted = false;
           settleAbort();
           return false;
         }
@@ -2221,6 +2227,7 @@ async function runClaudeQuery(
         if (writer) {
           ws = writer;
           turnCompleteSent = false;
+          lastTurnInterrupted = false;
           selfStartedTurn = true;
           activity.clear();
           proc.activity = undefined;
@@ -2449,6 +2456,16 @@ async function runClaudeQuery(
           stopReason: 'aborted'
         });
       }
+      return;
+    }
+
+    if (proc && turnCompleteSent && (proc.closing || lastTurnInterrupted)) {
+      // No turn is open: the client already has this one's terminal complete.
+      // A process being closed, or one whose last turn the user interrupted,
+      // can still end with the CLI's error result for that interrupted turn
+      // ("returned an error result: ... result_type=user"); that is not a
+      // failure anyone should see. A live turn's failure still goes out below.
+      console.warn(`[Claude SDK] Process of session ${proc.sessionId} ended with an error after its turn was over (${proc.closing ? 'closing' : 'interrupted'}):`, (error as Error)?.message || error);
       return;
     }
 

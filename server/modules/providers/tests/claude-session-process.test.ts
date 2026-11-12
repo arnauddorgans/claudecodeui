@@ -27,11 +27,15 @@ import type { AnyRecord, ProviderRuntimeContext, SessionProcessSnapshot } from '
 function createChannel<T>() {
   const queue: T[] = [];
   let ended = false;
+  let failure: Error | null = null;
   let wake: (() => void) | null = null;
   const stream = (async function* () {
     for (;;) {
       while (queue.length > 0) {
         yield queue.shift() as T;
+      }
+      if (failure) {
+        throw failure;
       }
       if (ended) {
         return;
@@ -44,6 +48,8 @@ function createChannel<T>() {
     stream,
     push(value: T) { queue.push(value); wake?.(); },
     end() { ended = true; wake?.(); },
+    /** Ends the stream by throwing, as the SDK does on an error result. */
+    fail(error: Error) { failure = error; wake?.(); },
   };
 }
 
@@ -58,6 +64,8 @@ class FakeQuery {
   onInput: ((message: AnyRecord) => void) | null = null;
   readonly options: AnyRecord;
   readonly output = createChannel<AnyRecord>();
+  /** Set: the stream throws this when stdin ends, instead of ending cleanly. */
+  failOnExit: Error | null = null;
 
   constructor(prompt: AsyncIterable<unknown>, options: AnyRecord) {
     this.options = options;
@@ -70,7 +78,11 @@ class FakeQuery {
       this.onInput?.(message as AnyRecord);
     }
     this.exited = true;
-    this.output.end();
+    if (this.failOnExit) {
+      this.output.fail(this.failOnExit);
+    } else {
+      this.output.end();
+    }
   }
 
   emit(message: AnyRecord): void {
@@ -229,6 +241,42 @@ test('abort interrupts the turn and keeps the process', async () => {
   assert.equal(queries.length, 1);
   assert.equal(writer.frames.filter((frame) => frame.kind === 'complete').length, 1);
   await closeClaudeSDKSession('app-2');
+});
+
+test('closing after an abort stays silent when the CLI ends the interrupted turn with an error', async () => {
+  const { context, queries } = createContext((query) => { query.onInput = () => {}; });
+  const writer = createWriter();
+
+  const turn = queryClaudeSDK('hello', { sessionId: 'app-2b' }, writer as never, context);
+  await until(() => Boolean(getSessionProcess('app-2b')));
+  assert.equal(await abortClaudeSDKSession('app-2b'), true);
+  queries[0].emit({ type: 'result', subtype: 'error_during_execution', session_id: 'sid-2b' });
+  await turn;
+
+  // What the SDK does once stdin closes on an interrupted turn.
+  queries[0].failOnExit = new Error('Claude Code returned an error result: [ede_diagnostic] result_type=user');
+  assert.equal(await closeClaudeSDKSession('app-2b'), true);
+  await until(() => getSessionProcess('app-2b') === null);
+  await tick();
+
+  assert.deepEqual(writer.frames.filter((frame) => frame.kind === 'error'), [], 'no error frame for the interrupted turn');
+  assert.equal(writer.frames.some((frame) => frame.kind === 'complete'), false, 'the abort handler sent the only complete');
+});
+
+test('a live turn whose stream throws still reports the error', async () => {
+  const { context, queries } = createContext((query) => {
+    query.onInput = () => { query.emit({ type: 'system', subtype: 'init', session_id: 'sid-2c' }); };
+  });
+  const writer = createWriter();
+
+  const turn = queryClaudeSDK('hello', { sessionId: 'app-2c' }, writer as never, context);
+  await until(() => Boolean(getSessionProcess('app-2c')));
+  await tick();
+  queries[0].output.fail(new Error('boom'));
+  await turn;
+
+  assert.equal(writer.frames.filter((frame) => frame.kind === 'error').length, 1, 'the failure reaches the client');
+  assert.ok(writer.frames.find((frame) => frame.kind === 'complete'), 'and a terminal complete follows');
 });
 
 test('editing a sent message replaces the process', async () => {
