@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, realpath, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -255,6 +255,25 @@ test('another working directory replaces the process', async () => {
   assert.equal(queries.length, 2);
   assert.equal(queries[0].exited, true);
   await closeClaudeSDKSession('app-3b');
+});
+
+test('the same directory by another path keeps the process (the row reads the cwd back resolved)', async () => {
+  const { context, queries } = createContext();
+  const writer = createWriter();
+  const real = await mkdtemp(path.join(os.tmpdir(), 'claude-session-cwd-'));
+  const link = `${real}-link`;
+  await symlink(real, link);
+
+  // The first turn runs in the path the session was created with; the CLI
+  // writes its resolved cwd to the transcript, which the row then carries.
+  await queryClaudeSDK('hello', { sessionId: 'app-3c', cwd: link }, writer as never, context);
+  await queryClaudeSDK('again', { sessionId: 'app-3c', cwd: await realpath(link) }, writer as never, context);
+
+  assert.equal(queries.length, 1, 'one process for both turns');
+  assert.equal(queries[0].exited, false);
+  assert.equal(queries[0].consumed.length, 2);
+  assert.equal(getSessionProcess('app-3c')?.state, 'chat');
+  await closeClaudeSDKSession('app-3c');
 });
 
 test('model, permission mode and effort change on the live process', async () => {

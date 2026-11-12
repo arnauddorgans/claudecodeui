@@ -13,7 +13,7 @@
  */
 
 import crypto from 'crypto';
-import { promises as fs } from 'fs';
+import { promises as fs, realpathSync } from 'fs';
 import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
@@ -1445,7 +1445,27 @@ function canTakeTurn(proc: SessionProcess, options: AnyRecord): boolean {
   if (options.resumeAnchorId || options.resumeFromScratch) {
     return false;
   }
-  return !options.cwd || !proc.cwd || options.cwd === proc.cwd;
+  return !options.cwd || !proc.cwd || isSameDirectory(options.cwd, proc.cwd);
+}
+
+/**
+ * Whether two working directories are the same one on disk. The session row's
+ * project path is re-read from the transcript after the first turn, and the
+ * CLI records its cwd resolved (`/tmp/x` becomes `/private/tmp/x` on macOS),
+ * so a plain string comparison would replace the process on the second turn.
+ */
+function isSameDirectory(a: string, b: string): boolean {
+  if (a === b) {
+    return true;
+  }
+  const canonical = (dir: string) => {
+    try {
+      return realpathSync.native(dir);
+    } catch {
+      return path.resolve(dir);
+    }
+  };
+  return canonical(a) === canonical(b);
 }
 
 /** The SDK's control requests the persistent process uses, absent from the test seam's type. */
