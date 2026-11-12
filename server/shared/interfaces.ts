@@ -98,6 +98,14 @@ export interface IProviderSessionProcesses {
   list(): SessionProcessSnapshot[];
   /** Every start, end, turn start or end, and task start or end. Returns the unsubscribe. */
   onChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
+  /**
+   * Installs what the runtime asks for a writer when a process starts a turn
+   * nobody sent (a background task reporting back). Null refuses; the turn
+   * then goes out on the previous turn's writer, unannounced.
+   */
+  onSelfStartedTurn?(
+    open: (sessionId: string, userId: string | number | null) => ProviderRuntimeWriter | null,
+  ): () => void;
   /** Ends every process, for the server's shutdown. */
   closeAll(): Promise<void>;
 }

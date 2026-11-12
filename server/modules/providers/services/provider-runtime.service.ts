@@ -140,6 +140,13 @@ export function createProviderRuntimeService(
       return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
     },
 
+    onSelfStartedTurn(open: (sessionId: string, userId: string | number | null) => ProviderRuntimeWriter | null): () => void {
+      const unsubscribes = dependencies.listProviders()
+        .map((provider) => provider.runtime.processes?.onSelfStartedTurn?.(open))
+        .filter((unsubscribe): unsubscribe is () => void => typeof unsubscribe === 'function');
+      return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+    },
+
     async closeAllSessionProcesses(): Promise<void> {
       await Promise.all(dependencies.listProviders().map((provider) => provider.runtime.processes?.closeAll()));
     },

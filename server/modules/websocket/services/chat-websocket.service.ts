@@ -99,6 +99,11 @@ export type ProviderRuntimeGateway = SideQuestionRuntime & {
   /** The session's process, or null when it has none. */
   getSessionProcess?(sessionId: string): SessionProcessSnapshot | null;
   onSessionProcessChange?(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
+  /**
+   * Installs what a runtime asks for a writer when its process starts a turn
+   * nobody sent. Absent for runtimes that keep no process between turns.
+   */
+  onSelfStartedTurn?(open: (sessionId: string, userId: string | number | null) => ProviderRuntimeWriter | null): () => void;
 };
 
 type ChatWebSocketDependencies = {
@@ -850,6 +855,11 @@ function handleChatSubscribe(
     const run = chatRunRegistry.getRun(sessionId);
     const isProcessing = chatRunRegistry.isProcessing(sessionId);
 
+    // Asking once is asking for the session, not for the run that happens to
+    // be going: the next one — a turn the session's own process starts
+    // included — finds this socket in its audience from the start.
+    chatRunRegistry.watchSession(sessionId, ws);
+
     // Future live events for this run should land on the socket that asked —
     // this is what makes mid-stream page refreshes work for all providers.
     // A session whose turn ended but whose background work is still going
@@ -994,6 +1004,36 @@ export async function runDetachedChatTurn(
   );
 }
 
+/**
+ * Opens a run for a turn a session's own process started, and hands back the
+ * writer for it (`onSelfStartedTurn`, SESSION_PROCESS_CLOSE=manual).
+ *
+ * Registering the run is the whole point: it puts the session in
+ * `/sessions/running`, makes `chat_subscribed` say it is processing, gives the
+ * turn's frames a `seq` of their own from 1 and a replay buffer, and carries
+ * the terminal `complete` at the end, which is what a push bridge turns into
+ * "Claude replied". Its audience is whoever already watches the session.
+ *
+ * Null when there is nothing to open a run for: an unknown session, or one
+ * already running (a client's turn wins).
+ */
+export function startSelfStartedRun(sessionId: string, userId: string | number | null): ProviderRuntimeWriter | null {
+  const session = sessionsDb.getSessionById(sessionId);
+  if (!session) {
+    return null;
+  }
+
+  const run = chatRunRegistry.startRun({
+    appSessionId: sessionId,
+    provider: session.provider as LLMProvider,
+    providerSessionId: session.provider_session_id,
+    connection: null,
+    userId,
+  });
+
+  return run ? (run.writer as ProviderRuntimeWriter) : null;
+}
+
 export function handleChatConnection(
   ws: WebSocket,
   request: AuthenticatedWebSocketRequest,
@@ -1056,5 +1096,6 @@ export function handleChatConnection(
   ws.on('close', () => {
     console.log('[INFO] Chat client disconnected');
     connectedClients.delete(ws);
+    chatRunRegistry.forgetConnection(ws);
   });
 }

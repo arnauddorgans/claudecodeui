@@ -204,6 +204,60 @@ type SessionProcess = {
 const sessionProcesses = new Map<string, SessionProcess>();
 const processListeners = new Set<(snapshot: SessionProcessSnapshot) => void>();
 
+/**
+ * Opens a run for a turn a session's process starts by itself and hands back
+ * its writer, or null to refuse. Installed by the chat gateway.
+ */
+type SelfStartedTurnOpener = (sessionId: string, userId: string | number | null) => ClaudeRuntimeWriter | null;
+let selfStartedTurnOpener: SelfStartedTurnOpener | null = null;
+
+function onSelfStartedTurn(open: SelfStartedTurnOpener): () => void {
+  selfStartedTurnOpener = open;
+  return () => {
+    if (selfStartedTurnOpener === open) {
+      selfStartedTurnOpener = null;
+    }
+  };
+}
+
+/**
+ * System messages that are the model's turn itself, as opposed to bookkeeping
+ * about the process's background work.
+ */
+const TURN_SYSTEM_SUBTYPES = new Set(['init', 'thinking_tokens', 'status', 'compact_boundary', 'api_retry']);
+
+/**
+ * True for the first message of a turn of the session's own that no client
+ * asked for: a background task finishing makes the CLI reply to the
+ * `<task-notification>` it injects, and a hook or a scheduled wake-up does the
+ * same.
+ *
+ * The turn opens on its first message, whatever its kind: waiting for an
+ * `assistant` one is too late, since it only lands once the model has
+ * finished it, and everything before it (`init`, the thinking) would go out
+ * on the finished run's writer. A subagent's traffic does not open one (it
+ * belongs to the task that spawned it), nor does the bookkeeping the CLI emits
+ * between turns (`task_*`, hooks, `tool_progress`, `result`,
+ * `prompt_suggestion`): a run opened on that would refuse the user's own
+ * `chat.send` until some later `result`.
+ */
+export function startsSelfStartedTurn(sdkMessage: AnyRecord | null | undefined): boolean {
+  if (sdkMessage?.parent_tool_use_id) {
+    return false;
+  }
+  switch (sdkMessage?.type) {
+    case 'user':
+    case 'assistant':
+    case 'stream_event':
+    case 'tool_use_summary':
+      return true;
+    case 'system':
+      return TURN_SYSTEM_SUBTYPES.has(sdkMessage.subtype);
+    default:
+      return false;
+  }
+}
+
 /** How long a closed process may take to leave before it is killed. */
 const CLOSE_GRACE_MS = parseInt(process.env.CLAUDE_CLOSE_GRACE_MS ?? '', 10) || 10000;
 /** How long an interrupted turn may take to report its `result` before the next turn goes in anyway. */
@@ -1478,8 +1532,11 @@ async function runClaudeQuery(
   let settleTurn: (() => void) | null = persistent?.firstTurnSettled ?? null;
   const rememberedTools = new Set<string>();
   let abortSettled: Promise<void> = Promise.resolve();
-  let finishAbortedTurn: (() => void) | null = null;
+  // Ends an interrupted turn: set by `interruptTurn`, run at its `result`.
+  const abortedTurn: { finish: (() => void) | null } = { finish: null };
   let processEnded = false;
+  // The turn open now was started by the CLI itself (see `startsSelfStartedTurn`).
+  let selfStartedTurn = false;
   let markProcessExited: () => void = () => {};
   const processExited = new Promise<void>((resolve) => { markProcessExited = resolve; });
   const turnSettled = () => {
@@ -1885,6 +1942,7 @@ async function runClaudeQuery(
           sessionSummary = nextOptions.sessionSummary;
         }
         turnCompleteSent = false;
+        selfStartedTurn = false;
         assistantBudgetSent = false;
         backgroundWorkPending = false;
         sawTaskEventThisTurn = false;
@@ -1907,16 +1965,16 @@ async function runClaudeQuery(
       // open until its own `result` (or ABORT_SETTLE_MS), so the next turn's
       // `result` cannot be taken for it.
       const interruptTurn: SessionProcess['interruptTurn'] = async () => {
-        if (turnCompleteSent || finishAbortedTurn) {
-          return Boolean(finishAbortedTurn);
+        if (turnCompleteSent || abortedTurn.finish) {
+          return Boolean(abortedTurn.finish);
         }
         abortedSessionIds.add(key);
         let settleAbort: () => void = () => {};
         abortSettled = new Promise<void>((resolve) => { settleAbort = resolve; });
-        const settleTimer = setTimeout(() => finishAbortedTurn?.(), ABORT_SETTLE_MS);
+        const settleTimer = setTimeout(() => abortedTurn.finish?.(), ABORT_SETTLE_MS);
         settleTimer.unref?.();
-        finishAbortedTurn = () => {
-          finishAbortedTurn = null;
+        abortedTurn.finish = () => {
+          abortedTurn.finish = null;
           clearTimeout(settleTimer);
           abortedSessionIds.delete(key);
           if (!turnCompleteSent) {
@@ -1938,7 +1996,7 @@ async function runClaudeQuery(
           return true;
         } catch (error) {
           console.error(`Error interrupting the turn of session ${key}:`, (error as Error)?.message || error);
-          finishAbortedTurn = null;
+          abortedTurn.finish = null;
           clearTimeout(settleTimer);
           abortedSessionIds.delete(key);
           settleAbort();
@@ -1997,7 +2055,21 @@ async function runClaudeQuery(
       // The turn is done as far as the client is concerned.
       const abortPending = sessionKey() ? abortedSessionIds.has(sessionKey()) : false;
       const stillOutstanding = backgroundWork.hasOutstanding(sessionKey()!);
-      if (!turnCompleteSent && !abortPending) {
+      if (!turnCompleteSent && !abortPending && selfStartedTurn) {
+        // A turn the CLI started by itself is background work reporting back,
+        // announced as such; its run still ends with a complete of its own.
+        turnCompleteSent = true;
+        selfStartedTurn = false;
+        ws.send(createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 0 }));
+        if (!stillOutstanding) {
+          notifyBackgroundWorkCompleted({
+            userId: ws?.userId || null,
+            provider: 'claude',
+            sessionId: sessionId || capturedSessionId || null,
+            sessionName: sessionSummary
+          });
+        }
+      } else if (!turnCompleteSent && !abortPending) {
         turnCompleteSent = true;
         ws.send(createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 0 }));
         notifyRunStopped({
@@ -2099,6 +2171,31 @@ async function runClaudeQuery(
         }
       } else {
         // session_id already captured
+      }
+
+      // A message with no turn open, on a persistent process, is the CLI
+      // starting a turn nobody sent. It gets a run of its own — opened before
+      // anything is routed, so its first message goes out on it too — and
+      // ends with a `complete` like a client's turn.
+      if (
+        proc
+        && turnCompleteSent
+        && !proc.closing
+        && !abortedTurn.finish
+        && startsSelfStartedTurn(message)
+      ) {
+        const writer = selfStartedTurnOpener?.(proc.sessionId, ws?.userId ?? null) ?? null;
+        if (writer) {
+          ws = writer;
+          turnCompleteSent = false;
+          selfStartedTurn = true;
+          assistantBudgetSent = false;
+          backgroundWorkPending = false;
+          sawTaskEventThisTurn = false;
+          proc.turnActive = true;
+          emitProcessChange(proc);
+          console.log('Turn started by the CLI itself for session:', proc.sessionId);
+        }
       }
 
       // The follow-up turn for unread steered messages has started; its own
@@ -2223,10 +2320,10 @@ async function runClaudeQuery(
 
       if (message.type === 'result') {
         const abortPending = sessionKey() ? abortedSessionIds.has(sessionKey()) : false;
-        if (finishAbortedTurn) {
+        if (abortedTurn.finish) {
           // The interrupted turn of a persistent process has ended; the
           // gateway already sent its terminal complete.
-          finishAbortedTurn();
+          abortedTurn.finish();
         } else if (pendingSteerIds.size > 0 && !abortPending) {
           // The turn ended before Claude reached a tool-call boundary, so the
           // steered messages it never read are still queued in the CLI, which
@@ -2342,8 +2439,7 @@ async function runClaudeQuery(
     // every client hears it ended (unless a newer process already took the
     // session over).
     processEnded = true;
-    // Set from `interruptTurn`, which TS cannot see from here.
-    (finishAbortedTurn as (() => void) | null)?.();
+    abortedTurn.finish?.();
     if (proc) {
       const ended = proc;
       ended.closing = true;
@@ -2716,6 +2812,7 @@ export const claudeRuntime = {
     get: getSessionProcess,
     list: listSessionProcesses,
     onChange: onSessionProcessChange,
+    onSelfStartedTurn,
     closeAll: closeAllClaudeSDKSessions,
   },
 };
@@ -2740,4 +2837,5 @@ export {
   getSessionProcess,
   listSessionProcesses,
   onSessionProcessChange,
+  onSelfStartedTurn,
 };
