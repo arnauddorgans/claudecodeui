@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   abortClaudeSDKSession,
   closeClaudeSDKSession,
+  getSessionCommands,
   getSessionProcess,
   listClaudeSDKBackgroundWork,
   onSessionProcessChange,
@@ -66,6 +67,8 @@ class FakeQuery {
   readonly output = createChannel<AnyRecord>();
   /** Set: the stream throws this when stdin ends, instead of ending cleanly. */
   failOnExit: Error | null = null;
+  /** The `initialize` answer's commands, then the latest `commands_changed` push, as the SDK keeps them. */
+  commands: AnyRecord[] = [];
 
   constructor(prompt: AsyncIterable<unknown>, options: AnyRecord) {
     this.options = options;
@@ -86,8 +89,13 @@ class FakeQuery {
   }
 
   emit(message: AnyRecord): void {
+    if (message.type === 'system' && message.subtype === 'commands_changed') {
+      this.commands = message.commands;
+    }
     this.output.push(message);
   }
+
+  async supportedCommands(): Promise<AnyRecord[]> { return this.commands; }
 
   /** A turn as the CLI answers it: init, one assistant message, the result. */
   answer(sessionId: string): void {
@@ -489,4 +497,50 @@ test('the turn\'s activity rides on the process record while it runs, and is gon
   await turn;
   assert.equal('activity' in (getSessionProcess('app-13') ?? {}), false, 'no activity key between turns');
   await closeClaudeSDKSession('app-13');
+});
+
+test('the live process lists its slash commands, and a pushed list replaces them', async () => {
+  const { context, queries } = createContext((query) => {
+    query.commands = [
+      { name: 'clear', description: 'Clear the conversation', argumentHint: '', aliases: ['reset'], builtin: true },
+      { name: 'graphify', description: 'Build a graph (user)', argumentHint: '<path>' },
+    ];
+    query.onInput = () => query.answer('sid-c');
+  });
+  const writer = createWriter();
+  const changes: SessionProcessSnapshot[] = [];
+  const unsubscribe = onSessionProcessChange((snapshot) => changes.push(snapshot));
+
+  assert.equal(await getSessionCommands('app-c'), null, 'no process, no list');
+  await queryClaudeSDK('hello', { sessionId: 'app-c' }, writer as never, context);
+
+  const first = await getSessionCommands('app-c');
+  assert.deepEqual(first?.commands, [
+    { name: 'clear', description: 'Clear the conversation', argumentHint: '', aliases: ['reset'], builtin: true },
+    { name: 'graphify', description: 'Build a graph (user)', argumentHint: '<path>', aliases: [], builtin: false },
+  ]);
+  assert.equal(getSessionProcess('app-c')?.commandsVersion, undefined, 'no push yet');
+
+  // A skill found mid-session: the CLI pushes the whole list again, between turns here.
+  queries[0].emit({
+    type: 'system',
+    subtype: 'commands_changed',
+    session_id: 'sid-c',
+    uuid: 'u-1',
+    commands: [{ name: 'deploy', description: 'Ship it (project)', argumentHint: '' }],
+  });
+  await until(() => getSessionProcess('app-c')?.commandsVersion === 1);
+  assert.equal(changes.at(-1)?.commandsVersion, 1, 'the change is announced');
+  assert.equal(changes.at(-1)?.turnActive, false, 'and opens no turn');
+  const second = await getSessionCommands('app-c');
+  assert.deepEqual(second?.commands, [
+    { name: 'deploy', description: 'Ship it (project)', argumentHint: '', aliases: [], builtin: false },
+  ], 'replaced, not merged');
+  assert.ok((second?.updatedAt ?? 0) >= (first?.updatedAt ?? Infinity));
+  assert.equal(queries.length, 1, 'no process started for any of it');
+  assert.equal(queries[0].consumed.length, 1, 'and no turn sent');
+
+  unsubscribe();
+  await closeClaudeSDKSession('app-c');
+  assert.equal(await getSessionCommands('app-c'), null, 'a closed process lists nothing');
 });

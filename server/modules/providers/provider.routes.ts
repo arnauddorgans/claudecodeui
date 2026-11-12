@@ -949,6 +949,15 @@ router.get(
   }),
 );
 
+// The live process's slash commands; 409 SESSION_PROCESS_NOT_RUNNING without one.
+router.get(
+  '/sessions/:sessionId/commands',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    res.json(createApiSuccessResponse(await sessionsService.getSessionCommands(sessionId)));
+  }),
+);
+
 router.get(
   '/sessions/:sessionId/token-usage',
   asyncHandler(async (req: Request, res: Response) => {

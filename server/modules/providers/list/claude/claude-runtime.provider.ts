@@ -51,6 +51,7 @@ import type {
   ProviderModelsDefinition,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
+  SessionCommandsSnapshot,
   SessionProcessActivity,
   SessionProcessSnapshot,
   SessionProcessState,
@@ -195,6 +196,9 @@ type SessionProcess = {
   activity?: SessionProcessActivity;
   /** Every task the process ran, ended ones included, oldest first. */
   tasks: Map<string, SessionProcessTask>;
+  /** `commands_changed` pushes received, and when the list last changed (epoch ms). */
+  commandsVersion: number;
+  commandsUpdatedAt: number;
   /** Settles once the run loop has ended. */
   exited: Promise<void>;
   /** Writes the next turn into the process; resolves when that turn has ended. */
@@ -293,6 +297,7 @@ function describeProcess(proc: SessionProcess, state: SessionProcessState = 'cha
     turnActive: state === 'chat' && proc.turnActive,
     ...(state === 'chat' && proc.turnActive && proc.activity ? { activity: { ...proc.activity } } : {}),
     tasks: Array.from(proc.tasks.values(), (task) => ({ ...task })),
+    ...(proc.commandsVersion > 0 ? { commandsVersion: proc.commandsVersion } : {}),
   };
 }
 
@@ -382,6 +387,30 @@ function recordProcessTask(proc: SessionProcess, message: AnyRecord, nested: boo
 function getSessionProcess(sessionId: string): SessionProcessSnapshot | null {
   const proc = sessionProcesses.get(sessionId);
   return proc && !proc.closing ? describeProcess(proc) : null;
+}
+
+/**
+ * The slash commands of a session's live process: the CLI's `initialize`
+ * answer, which the SDK caches, or the full list it pushed last
+ * (`commands_changed`), which `supportedCommands()` returns instead. No
+ * request reaches the model.
+ */
+async function getSessionCommands(sessionId: string): Promise<SessionCommandsSnapshot | null> {
+  const proc = sessionProcesses.get(sessionId);
+  if (!proc || proc.closing || typeof proc.instance.supportedCommands !== 'function') {
+    return null;
+  }
+  const commands = await proc.instance.supportedCommands();
+  return {
+    commands: (Array.isArray(commands) ? commands : []).map((command) => ({
+      name: command.name,
+      description: command.description ?? '',
+      argumentHint: command.argumentHint ?? '',
+      aliases: Array.isArray(command.aliases) ? command.aliases : [],
+      builtin: command.builtin === true,
+    })),
+    updatedAt: proc.commandsUpdatedAt,
+  };
 }
 
 function listSessionProcesses(): SessionProcessSnapshot[] {
@@ -2078,6 +2107,8 @@ async function runClaudeQuery(
         turnActive: true,
         closing: false,
         tasks: new Map(),
+        commandsVersion: 0,
+        commandsUpdatedAt: Date.now(),
         exited: processExited,
         takeTurn,
         interruptTurn,
@@ -2349,6 +2380,15 @@ async function runClaudeQuery(
         sawTaskEventThisTurn = true;
       }
       backgroundWork.apply(sessionKey()!, message);
+      // The SDK keeps the pushed list for `supportedCommands()`; clients learn
+      // it changed from the process's `commandsVersion`.
+      if (proc && message.type === 'system' && message.subtype === 'commands_changed') {
+        proc.commandsVersion += 1;
+        proc.commandsUpdatedAt = Date.now();
+        if (!proc.closing) {
+          emitProcessChange(proc);
+        }
+      }
       if (proc) {
         const nested = typeof message.task_id === 'string'
           && backgroundWork.outstanding(sessionKey()!).some((task) => task.taskId === message.task_id && task.nested);
@@ -2881,6 +2921,7 @@ export const claudeRuntime = {
     onChange: onSessionProcessChange,
     onSelfStartedTurn,
     closeAll: closeAllClaudeSDKSessions,
+    commands: getSessionCommands,
   },
 };
 
@@ -2902,6 +2943,7 @@ export {
   closeClaudeSDKSession,
   closeAllClaudeSDKSessions,
   getSessionProcess,
+  getSessionCommands,
   listSessionProcesses,
   onSessionProcessChange,
   onSelfStartedTurn,

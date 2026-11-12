@@ -450,6 +450,61 @@ test('the running-sessions route reports a session held open for background work
   }
 });
 
+test('the session commands route answers from the live process, never starting one', async () => {
+  const realResolveProvider = providerRegistry.resolveProvider;
+  const asked: string[] = [];
+  let live = true;
+  providerRegistry.resolveProvider = ((provider: string) => ({
+    id: provider,
+    runtime: {
+      processes: {
+        commands: async (sessionId: string) => {
+          asked.push(sessionId);
+          return live
+            ? { commands: [{ name: 'clear', description: 'Clear', argumentHint: '', aliases: [], builtin: true }], updatedAt: 1_700_000_000_000 }
+            : null;
+        },
+      },
+    },
+  })) as unknown as typeof providerRegistry.resolveProvider;
+
+  try {
+    await withProviderServer(async (baseUrl, workspacePath) => {
+      sessionsDb.createAppSession('commands-session', 'claude', workspacePath);
+      sessionsDb.assignProviderSessionId('commands-session', 'commands-provider-id');
+
+      for (const id of ['commands-session', 'commands-provider-id']) {
+        const response = await fetch(`${baseUrl}/api/providers/sessions/${id}/commands`);
+        const payload = await response.json() as { data: unknown };
+        assert.equal(response.status, 200, id);
+        assert.deepEqual(payload.data, {
+          commands: [{ name: 'clear', description: 'Clear', argumentHint: '', aliases: [], builtin: true }],
+          updatedAt: 1_700_000_000_000,
+          source: 'session',
+          sessionId: 'commands-session',
+        });
+      }
+      assert.deepEqual(asked, ['commands-session', 'commands-session'], 'the process is keyed by the app id');
+
+      live = false;
+      const idle = await fetch(`${baseUrl}/api/providers/sessions/commands-session/commands`);
+      assert.equal(idle.status, 409);
+      assert.equal(((await idle.json()) as { error: { code: string } }).error.code, 'SESSION_PROCESS_NOT_RUNNING');
+
+      const unknown = await fetch(`${baseUrl}/api/providers/sessions/no-such-session/commands`);
+      assert.equal(unknown.status, 404);
+      assert.equal(((await unknown.json()) as { error: { code: string } }).error.code, 'SESSION_NOT_FOUND');
+
+      const capabilities = await fetch(`${baseUrl}/api/providers/capabilities`);
+      const listed = ((await capabilities.json()) as { data: { providers: Array<{ provider: string; supportsSessionCommands: boolean }> } })
+        .data.providers.map(({ provider, supportsSessionCommands }) => [provider, supportsSessionCommands]);
+      assert.deepEqual(Object.fromEntries(listed), { claude: true, cursor: false, codex: false, opencode: false });
+    });
+  } finally {
+    providerRegistry.resolveProvider = realResolveProvider;
+  }
+});
+
 test('the CLI update route refuses while that provider is busy in a session', {
   skip: IS_PLATFORM ? 'platform mode refuses every CLI update before the busy check' : false,
 }, async () => {

@@ -54,6 +54,11 @@ type ProviderCapabilities = {
    * Requires a runtime that keeps its CLI's input open during a turn.
    */
   supportsSteering: boolean;
+  /**
+   * Whether `GET /sessions/:id/commands` can list a live session's slash
+   * commands, read from the process the session keeps between turns.
+   */
+  supportsSessionCommands: boolean;
 };
 
 /**
@@ -83,6 +88,8 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
     // Streaming input stays open for the whole run, and a user message written
     // to it with priority `next` joins the running turn.
     supportsSteering: true,
+    // The SDK keeps the CLI's command list on the session's query.
+    supportsSessionCommands: true,
   },
   cursor: {
     provider: 'cursor',
@@ -99,6 +106,7 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
     supportsSessionForking: false,
     supportsSideQuestions: false,
     supportsSteering: false,
+    supportsSessionCommands: false,
   },
   codex: {
     provider: 'codex',
@@ -119,6 +127,7 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
     supportsSessionForking: true,
     supportsSideQuestions: true,
     supportsSteering: false,
+    supportsSessionCommands: false,
   },
   opencode: {
     provider: 'opencode',
@@ -142,6 +151,7 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
     supportsSessionForking: false,
     supportsSideQuestions: true,
     supportsSteering: false,
+    supportsSessionCommands: false,
   },
 };
 

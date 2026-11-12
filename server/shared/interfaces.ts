@@ -18,6 +18,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
+  SessionCommandsSnapshot,
   SessionProcessSnapshot,
   SideQuestionOutcome,
   SideQuestionRequest,
@@ -108,6 +109,11 @@ export interface IProviderSessionProcesses {
   ): () => void;
   /** Ends every process, for the server's shutdown. */
   closeAll(): Promise<void>;
+  /**
+   * The slash commands the session's live process holds, without starting one
+   * or running a turn. Null when the session has no live process.
+   */
+  commands?(sessionId: string): Promise<SessionCommandsSnapshot | null>;
 }
 
 /**

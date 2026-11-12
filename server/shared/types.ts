@@ -643,6 +643,28 @@ export type SessionProcessSnapshot = {
   /** What the turn under way says it is doing; absent between turns. */
   activity?: SessionProcessActivity;
   tasks: SessionProcessTask[];
+  /**
+   * How many times the CLI pushed a new slash-command list since the process
+   * started; absent until the first push. A change means the list
+   * `GET /sessions/:id/commands` answers has changed.
+   */
+  commandsVersion?: number;
+};
+
+/** One slash command of a live session, as its CLI lists it. */
+export type SessionCommand = {
+  name: string;
+  description: string;
+  argumentHint: string;
+  aliases: string[];
+  /** Claude Code's own command, as opposed to a skill or a user, project or plugin command. */
+  builtin: boolean;
+};
+
+/** The slash commands a session's live process holds, and when they last changed (epoch ms). */
+export type SessionCommandsSnapshot = {
+  commands: SessionCommand[];
+  updatedAt: number;
 };
 
 /**
@@ -866,6 +888,8 @@ export type ProviderRuntimeContext = {
   createQuery?: (input: { prompt: AsyncIterable<unknown>; options: AnyRecord }) => AsyncIterable<unknown> & {
     interrupt(): Promise<unknown>;
     stopTask?(taskId: string): Promise<void>;
+    /** The CLI's slash commands: its `initialize` answer, or the latest `commands_changed` push. */
+    supportedCommands?(): Promise<Array<Partial<SessionCommand> & { name: string }>>;
   };
 };
 

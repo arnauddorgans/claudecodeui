@@ -13,6 +13,7 @@ import type {
   FetchHistoryResult,
   LLMProvider,
   NormalizedMessage,
+  SessionCommandsSnapshot,
   SessionProcessSnapshot,
   WorkflowAgentActivity,
 } from '@/shared/types.js';
@@ -116,6 +117,9 @@ async function removeFileIfExists(filePath: string): Promise<boolean> {
     throw error;
   }
 }
+
+/** How long `getSessionCommands` waits on a process's `initialize` answer. */
+const SESSION_COMMANDS_TIMEOUT_MS = 10_000;
 
 /**
  * Archive rows need a stable project label even when the owning project is not
@@ -221,6 +225,44 @@ export const sessionsService = {
     return sessionProcessRegistry.list(
       providerRegistry.listProviders().flatMap((provider) => provider.runtime.processes?.list() ?? []),
     );
+  },
+
+  /**
+   * The slash commands of a session's live process (by app id, falling back to
+   * the provider-native id). Never starts a process: without a live one the
+   * answer is 409, and a client asks elsewhere.
+   */
+  async getSessionCommands(
+    sessionId: string,
+  ): Promise<SessionCommandsSnapshot & { source: 'session'; sessionId: string }> {
+    const session =
+      sessionsDb.getSessionById(sessionId) ?? sessionsDb.getSessionByProviderSessionId(sessionId);
+    if (!session) {
+      throw new AppError(`Session "${sessionId}" was not found.`, {
+        code: 'SESSION_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+
+    const processes = providerRegistry.resolveProvider(session.provider).runtime.processes;
+    // A process still starting answers once its `initialize` is in; a CLI
+    // that never answers must not hold the request.
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new AppError('The session process did not list its commands in time.', {
+        code: 'SESSION_COMMANDS_TIMEOUT',
+        statusCode: 504,
+      })), SESSION_COMMANDS_TIMEOUT_MS);
+    });
+    const snapshot = await Promise.race([processes?.commands?.(session.session_id) ?? null, timeout])
+      .finally(() => clearTimeout(timer));
+    if (!snapshot) {
+      throw new AppError('The session has no live process to list its commands.', {
+        code: 'SESSION_PROCESS_NOT_RUNNING',
+        statusCode: 409,
+      });
+    }
+    return { ...snapshot, source: 'session', sessionId: session.session_id };
   },
 
   /**
