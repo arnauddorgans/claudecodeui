@@ -748,7 +748,8 @@ type MessageKind =
   | 'session_created'
   | 'history_truncated'
   | 'task_notification'
-  | 'task_status';
+  | 'task_status'
+  | 'tool_use_summary';
 
 // ---------------------------
 

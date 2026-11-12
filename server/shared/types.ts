@@ -228,7 +228,8 @@ export type MessageKind =
   | 'session_created'
   | 'history_truncated'
   | 'task_notification'
-  | 'task_status';
+  | 'task_status'
+  | 'tool_use_summary';
 
 /**
  * Event kinds added by the chat gateway layer on top of provider message kinds.
@@ -639,7 +640,22 @@ export type SessionProcessSnapshot = {
   since: number;
   providerSessionId: string | null;
   turnActive: boolean;
+  /** What the turn under way says it is doing; absent between turns. */
+  activity?: SessionProcessActivity;
   tasks: SessionProcessTask[];
+};
+
+/**
+ * The latest of each live activity frame of the turn under way (`status`
+ * `activity` and `thinking_tokens`, `tool_use_summary`).
+ */
+export type SessionProcessActivity = {
+  status: 'compacting' | 'requesting' | null;
+  compactResult?: 'success' | 'failed';
+  compactError?: string;
+  summary?: string;
+  summaryToolUseIds?: string[];
+  thinkingTokens?: number;
 };
 
 export type SessionProcessEvent = SessionProcessSnapshot & {

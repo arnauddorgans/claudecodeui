@@ -264,6 +264,8 @@ export function useChatRealtimeHandlers({
         // A process snapshot (SESSION_PROCESS_CLOSE=manual), not a message: it
         // has no `id`, and the reconciliation of live rows reads one on each.
         case 'session_process':
+        // The model's caption for its last tool calls: not a transcript row.
+        case 'tool_use_summary':
           return;
 
         default:
@@ -438,7 +440,9 @@ export function useChatRealtimeHandlers({
             }
           } else if (msg.text && sid) {
             onSessionProcessing?.(sid, {
-              statusText: msg.text as string,
+              // `activity` and `thinking_tokens` carry their payload in fields of
+              // their own; the discriminator is no label to show.
+              statusText: msg.text === 'activity' || msg.text === 'thinking_tokens' ? null : msg.text as string,
               canInterrupt: msg.canInterrupt !== false,
             });
           }

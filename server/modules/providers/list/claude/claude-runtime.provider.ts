@@ -28,6 +28,7 @@ import {
   CLAUDE_PREDEFINED_MODELS,
   CLAUDE_ULTRACODE_EFFORT
 } from '@/modules/providers/list/claude/claude-models.provider.js';
+import { createActivityRecorder, readClaudeActivityFrame } from '@/modules/providers/list/claude/claude-activity.js';
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import { askClaudeSideQuestion } from '@/modules/providers/list/claude/claude-side-question.provider.js';
 import {
@@ -50,6 +51,7 @@ import type {
   ProviderModelsDefinition,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
+  SessionProcessActivity,
   SessionProcessSnapshot,
   SessionProcessState,
   SessionProcessTask,
@@ -189,6 +191,8 @@ type SessionProcess = {
   providerSessionId: string | null;
   turnActive: boolean;
   closing: boolean;
+  /** What the turn under way says it is doing (`claude-activity.ts`). */
+  activity?: SessionProcessActivity;
   /** Every task the process ran, ended ones included, oldest first. */
   tasks: Map<string, SessionProcessTask>;
   /** Settles once the run loop has ended. */
@@ -287,6 +291,7 @@ function describeProcess(proc: SessionProcess, state: SessionProcessState = 'cha
     since: proc.since,
     providerSessionId: proc.providerSessionId,
     turnActive: state === 'chat' && proc.turnActive,
+    ...(state === 'chat' && proc.turnActive && proc.activity ? { activity: { ...proc.activity } } : {}),
     tasks: Array.from(proc.tasks.values(), (task) => ({ ...task })),
   };
 }
@@ -1539,9 +1544,15 @@ async function runClaudeQuery(
   let selfStartedTurn = false;
   let markProcessExited: () => void = () => {};
   const processExited = new Promise<void>((resolve) => { markProcessExited = resolve; });
+  // The live activity frames' latest of each, turn-scoped.
+  const activity = createActivityRecorder();
   const turnSettled = () => {
     const settle = settleTurn;
     settleTurn = null;
+    activity.clear();
+    if (proc) {
+      proc.activity = undefined;
+    }
     if (proc && proc.turnActive) {
       proc.turnActive = false;
       if (!proc.closing) {
@@ -1943,6 +1954,8 @@ async function runClaudeQuery(
         }
         turnCompleteSent = false;
         selfStartedTurn = false;
+        activity.clear();
+        record.activity = undefined;
         assistantBudgetSent = false;
         backgroundWorkPending = false;
         sawTaskEventThisTurn = false;
@@ -2189,6 +2202,8 @@ async function runClaudeQuery(
           ws = writer;
           turnCompleteSent = false;
           selfStartedTurn = true;
+          activity.clear();
+          proc.activity = undefined;
           assistantBudgetSent = false;
           backgroundWorkPending = false;
           sawTaskEventThisTurn = false;
@@ -2240,6 +2255,21 @@ async function runClaudeQuery(
           continue;
         }
         ws.send(msg);
+      }
+
+      // What the model says about its own work: live only, never in the transcript.
+      const activityFrame = readClaudeActivityFrame(message, sid);
+      if (activityFrame) {
+        const { forward, changed } = activity.record(activityFrame);
+        if (forward) {
+          ws.send(activityFrame);
+        }
+        if (proc) {
+          proc.activity = activity.snapshot();
+          if (changed && !proc.closing) {
+            emitProcessChange(proc);
+          }
+        }
       }
 
       if (

@@ -401,3 +401,25 @@ test('close under a turn interrupts it and leaves the complete to the caller', a
   assert.equal(writer.frames.some((frame) => frame.kind === 'complete'), false);
   assert.equal(getSessionProcess('app-12'), null);
 });
+
+test('the turn\'s activity rides on the process record while it runs, and is gone after', async () => {
+  const sid = 'sid-13';
+  const { context, queries } = createContext((query) => { query.onInput = () => {}; });
+  const writer = createWriter();
+
+  const turn = queryClaudeSDK('think', { sessionId: 'app-13' }, writer as never, context);
+  await until(() => Boolean(getSessionProcess('app-13')));
+  queries[0].emit({ type: 'system', subtype: 'init', session_id: sid });
+  queries[0].emit({ type: 'system', subtype: 'status', status: 'compacting', session_id: sid });
+  queries[0].emit({ type: 'tool_use_summary', summary: 'Read two files', preceding_tool_use_ids: ['tu-1'], session_id: sid });
+  await until(() => getSessionProcess('app-13')?.activity?.summary === 'Read two files');
+
+  assert.equal(getSessionProcess('app-13')?.activity?.status, 'compacting');
+  assert.deepEqual(writer.frames.filter((frame) => frame.text === 'activity').map((frame) => frame.activity), ['compacting']);
+  assert.equal(writer.frames.filter((frame) => frame.kind === 'tool_use_summary').length, 1);
+
+  queries[0].emit({ type: 'result', subtype: 'success', session_id: sid });
+  await turn;
+  assert.equal('activity' in (getSessionProcess('app-13') ?? {}), false, 'no activity key between turns');
+  await closeClaudeSDKSession('app-13');
+});
