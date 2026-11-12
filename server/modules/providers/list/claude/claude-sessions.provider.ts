@@ -36,6 +36,7 @@ import {
   getReportedClaudeContextWindow,
   summarizeClaudeTokenUsage,
 } from '@/modules/providers/services/provider-token-usage.service.js';
+import { transcriptRowsCache } from '@/modules/providers/services/transcript-rows-cache.service.js';
 
 const PROVIDER = 'claude';
 
@@ -477,25 +478,61 @@ function replaceLaunchToolResultContent(message: AnyRecord, replacement: string)
  * sent message makes a second path appear alongside the first.
  */
 async function readTranscriptRows(jsonlPath: string, providerSessionId: string): Promise<AnyRecord[]> {
-  const rows: AnyRecord[] = [];
-  const fileStream = fs.createReadStream(jsonlPath);
-  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+  // Through the rows cache: a transcript that grew since the last read is
+  // parsed from where that read stopped. Its rows are shared between reads,
+  // so a caller that writes to one copies it first.
+  const rows = await transcriptRowsCache.readRows({ filePath: jsonlPath, sessionId: providerSessionId });
+  return rows.filter((entry) => !isClaudeNonTurnMessageRow(entry));
+}
 
-  for await (const line of rl) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const entry = JSON.parse(line) as AnyRecord;
-      if (entry.sessionId === providerSessionId && !isClaudeNonTurnMessageRow(entry)) {
-        rows.push(entry);
-      }
-    } catch {
-      // A row can be half-written while the CLI is streaming into the file.
-    }
+/**
+ * Subagent transcripts already read, keyed by path and valid while the file
+ * keeps the size and mtime it had.
+ *
+ * A session's history read reads every subagent its transcript mentions, and a
+ * finished subagent's file never changes again: a long session re-read 35 of
+ * them, 112 MB, on every read to rebuild the same cards. Kept within a
+ * file-byte budget, least recently used first out. The result is shared, so it
+ * is never mutated: callers slice and map it.
+ */
+const subagentTranscriptCache = new Map<string, {
+  size: number;
+  mtimeMs: number;
+  transcript: ClaudeSubagentTranscript;
+}>();
+const MAX_CACHED_SUBAGENT_FILE_BYTES = 256 * 1024 * 1024;
+
+async function readClaudeSubagentTranscriptCached(filePath: string): Promise<ClaudeSubagentTranscript> {
+  let stat;
+  try {
+    stat = await fsp.stat(filePath);
+  } catch {
+    subagentTranscriptCache.delete(filePath);
+    return readClaudeSubagentTranscript(filePath);
   }
 
-  return rows;
+  const cached = subagentTranscriptCache.get(filePath);
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+    subagentTranscriptCache.delete(filePath);
+    subagentTranscriptCache.set(filePath, cached);
+    return cached.transcript;
+  }
+
+  const transcript = await readClaudeSubagentTranscript(filePath);
+  subagentTranscriptCache.delete(filePath);
+  subagentTranscriptCache.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs, transcript });
+  let total = 0;
+  for (const entry of subagentTranscriptCache.values()) {
+    total += entry.size;
+  }
+  for (const [key, entry] of subagentTranscriptCache) {
+    if (total <= MAX_CACHED_SUBAGENT_FILE_BYTES || subagentTranscriptCache.size <= 1) {
+      break;
+    }
+    total -= entry.size;
+    subagentTranscriptCache.delete(key);
+  }
+  return transcript;
 }
 
 /** True for a row the user typed, as opposed to a tool result or an injected note. */
@@ -713,9 +750,11 @@ async function getSessionMessages(
 
     const projectDir = path.dirname(jsonLPath);
 
+    // The rows come from the rows cache and are shared between reads: the
+    // launch rows the fold below writes to are copied first.
     const messages = dropSupersededPromptBranches(
       await readTranscriptRows(jsonLPath, providerSessionId),
-    );
+    ).map((row) => (readBackgroundLaunch(row.toolUseResult) ? structuredClone(row) : row));
 
     const agentIds = new Set<string>();
     for (const message of messages) {
@@ -739,7 +778,7 @@ async function getSessionMessages(
       }
 
       const [transcript, meta] = await Promise.all([
-        readClaudeSubagentTranscript(located.transcriptPath),
+        readClaudeSubagentTranscriptCached(located.transcriptPath),
         readClaudeSubagentMeta(located.metaPath),
       ]);
 
