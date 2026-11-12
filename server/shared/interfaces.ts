@@ -18,6 +18,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
+  SessionProcessSnapshot,
   SideQuestionOutcome,
   SideQuestionRequest,
   SideQuestionSink,
@@ -79,6 +80,26 @@ export interface IProviderRuntime {
    * a runtime that keeps its CLI's input open during a turn implements this.
    */
   steer?(sessionId: string, command: string, options: AnyRecord): Promise<boolean>;
+  /**
+   * Ends the session's process, under `SESSION_PROCESS_CLOSE=manual` where a
+   * runtime keeps one between turns. A turn in flight is interrupted; the
+   * caller sends its terminal `complete`. False when there is none.
+   */
+  close?(sessionId: string): Promise<boolean>;
+  /** The processes the runtime keeps between turns (`SESSION_PROCESS_CLOSE=manual`). */
+  processes?: IProviderSessionProcesses;
+}
+
+/**
+ * The session processes a runtime keeps alive between turns.
+ */
+export interface IProviderSessionProcesses {
+  get(sessionId: string): SessionProcessSnapshot | null;
+  list(): SessionProcessSnapshot[];
+  /** Every start, end, turn start or end, and task start or end. Returns the unsubscribe. */
+  onChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
+  /** Ends every process, for the server's shutdown. */
+  closeAll(): Promise<void>;
 }
 
 /**

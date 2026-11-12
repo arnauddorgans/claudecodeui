@@ -10,6 +10,7 @@ import type {
   ProviderRunFunction,
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
+  SessionProcessSnapshot,
   SideQuestionOutcome,
   SideQuestionRequest,
   SideQuestionSink,
@@ -110,6 +111,37 @@ export function createProviderRuntimeService(
       // A runtime that cannot write into a running turn has nothing to steer.
       const { runtime } = dependencies.resolveProvider(providerName);
       return Boolean(await runtime.steer?.(sessionId, command, options));
+    },
+
+    /** Ends the session's process (`SESSION_PROCESS_CLOSE=manual`); false when it has none. */
+    async close(providerName: LLMProvider, sessionId: string): Promise<boolean> {
+      const { runtime } = dependencies.resolveProvider(providerName);
+      return Boolean(await runtime.close?.(sessionId));
+    },
+
+    getSessionProcess(sessionId: string): SessionProcessSnapshot | null {
+      for (const provider of dependencies.listProviders()) {
+        const snapshot = provider.runtime.processes?.get(sessionId);
+        if (snapshot) {
+          return snapshot;
+        }
+      }
+      return null;
+    },
+
+    listSessionProcesses(): SessionProcessSnapshot[] {
+      return dependencies.listProviders().flatMap((provider) => provider.runtime.processes?.list() ?? []);
+    },
+
+    onSessionProcessChange(listener: (snapshot: SessionProcessSnapshot) => void): () => void {
+      const unsubscribes = dependencies.listProviders()
+        .map((provider) => provider.runtime.processes?.onChange(listener))
+        .filter((unsubscribe): unsubscribe is () => void => typeof unsubscribe === 'function');
+      return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+    },
+
+    async closeAllSessionProcesses(): Promise<void> {
+      await Promise.all(dependencies.listProviders().map((provider) => provider.runtime.processes?.closeAll()));
     },
 
     hasBackgroundWork(sessionId: string): boolean {

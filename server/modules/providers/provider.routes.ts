@@ -21,6 +21,7 @@ import type {
   ProviderSkillCreateInput,
   UpsertProviderMcpServerInput,
 } from '@/shared/types.js';
+import { resolveSessionProcessClose } from '@/shared/session-process-close.js';
 import { AppError, asyncHandler, createApiSuccessResponse, SIDE_QUESTION_ID_PATTERN } from '@/shared/utils.js';
 
 const router = express.Router();
@@ -911,6 +912,12 @@ router.get(
   '/sessions/running',
   asyncHandler(async (_req: Request, res: Response) => {
     const sessions = await sessionsService.listRunningSessions();
+    // Only a server that keeps processes between turns says so: a client
+    // reads the key's presence as "this server has a process registry".
+    if (resolveSessionProcessClose() === 'manual') {
+      res.json(createApiSuccessResponse({ sessions, processes: sessionsService.listSessionProcesses() }));
+      return;
+    }
     res.json(createApiSuccessResponse({ sessions }));
   }),
 );

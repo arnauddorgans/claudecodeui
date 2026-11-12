@@ -13,6 +13,7 @@ import type {
   FetchHistoryResult,
   LLMProvider,
   NormalizedMessage,
+  SessionProcessSnapshot,
   WorkflowAgentActivity,
 } from '@/shared/types.js';
 import { AppError, sliceTailPage } from '@/shared/utils.js';
@@ -209,6 +210,14 @@ export const sessionsService = {
     }
 
     return entries;
+  },
+
+  /**
+   * The session processes alive under `SESSION_PROCESS_CLOSE=manual`, every
+   * provider's: what `/sessions/running` lists as `processes`.
+   */
+  listSessionProcesses(): SessionProcessSnapshot[] {
+    return providerRegistry.listProviders().flatMap((provider) => provider.runtime.processes?.list() ?? []);
   },
 
   /**

@@ -25,6 +25,7 @@ import type {
   LLMProvider,
   ProviderPermissionDecision,
   ProviderRuntimeWriter,
+  SessionProcessSnapshot,
   SideQuestion,
   SideQuestionEvent,
   SideQuestionRuntime,
@@ -90,6 +91,11 @@ export type ProviderRuntimeGateway = SideQuestionRuntime & {
   hasBackgroundWork(sessionId: string): boolean;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
+  /** Ends the session's process, for runtimes that keep one between turns (`SESSION_PROCESS_CLOSE=manual`). */
+  close?(provider: LLMProvider, sessionId: string): Promise<boolean>;
+  /** The session's process, or null when it has none. */
+  getSessionProcess?(sessionId: string): SessionProcessSnapshot | null;
+  onSessionProcessChange?(listener: (snapshot: SessionProcessSnapshot) => void): () => void;
 };
 
 type ChatWebSocketDependencies = {
@@ -687,6 +693,45 @@ async function handleChatAbort(
 }
 
 /**
+ * Handles `chat.close`: ends the session's process, under
+ * `SESSION_PROCESS_CLOSE=manual` where it outlives its turns. A turn in flight
+ * is interrupted and its terminal `complete { aborted: true }` emitted here, as
+ * `chat.abort` does. No ack: every client learns the process is gone from the
+ * `session_process` broadcast. A session with no process has nothing to close,
+ * which is not an error.
+ */
+async function handleChatClose(
+  ws: WebSocket,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies
+): Promise<void> {
+  const sessionId = readRequiredSessionId(data);
+  if (!sessionId) {
+    sendProtocolError(ws, 'SESSION_ID_REQUIRED', 'chat.close requires a sessionId.');
+    return;
+  }
+
+  const session = sessionsDb.getSessionById(sessionId);
+  if (!session) {
+    sendProtocolError(ws, 'SESSION_NOT_FOUND', `Session "${sessionId}" was not found.`, sessionId);
+    return;
+  }
+
+  const provider = session.provider as LLMProvider;
+  if (!dependencies.runtime.hasRuntime(provider)) {
+    sendProtocolError(ws, 'UNSUPPORTED_PROVIDER', `Provider "${provider}" is not available.`, sessionId);
+    return;
+  }
+
+  const run = chatRunRegistry.getRun(sessionId);
+  const wasRunning = run?.status === 'running';
+  await dependencies.runtime.close?.(provider, sessionId);
+  if (run && wasRunning) {
+    chatRunRegistry.completeRunIfCurrent(run, { exitCode: 0, aborted: true });
+  }
+}
+
+/**
  * Handles `chat.stop-task`: stops one background task of a session — an
  * agent, a workflow or a backgrounded command that is still going after its
  * turn ended. Unlike `chat.abort` there is no run to consult: the task lives
@@ -797,6 +842,11 @@ function handleChatSubscribe(
       isProcessing,
       lastSeq: run?.lastSeq ?? 0,
       pendingPermissions,
+      // Where the session's process lives, on a server that keeps one between
+      // turns; absent elsewhere.
+      ...(dependencies.runtime.getSessionProcess
+        ? { process: dependencies.runtime.getSessionProcess(sessionId) }
+        : {}),
       timestamp: new Date().toISOString(),
     });
 
@@ -838,6 +888,7 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  * - `chat.side_question`       { sessionId, sideQuestionId, question, options?: { model? } }
  * - `chat.steer`               { sessionId, messageId, content, options? }
  * - `chat.abort`               { sessionId }
+ * - `chat.close`               { sessionId }
  * - `chat.stop-task`           { sessionId, taskId }
  * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
  * - `chat.permission-response` { requestId, allow, updatedInput?, message?, rememberEntry? }
@@ -845,7 +896,7 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  * Outbound protocol (server to client): every frame is `kind`-based — either
  * a provider `NormalizedMessage` (with `seq`) or a gateway event
  * (`chat_subscribed`, `chat_steer_accepted`, `session_upserted`,
- * `loading_progress`, `protocol_error`, `side_question`).
+ * `session_process`, `loading_progress`, `protocol_error`, `side_question`).
  */
 /**
  * Runs a turn for a session with no client attached.
@@ -947,6 +998,9 @@ export function handleChatConnection(
           return;
         case 'chat.abort':
           await handleChatAbort(ws, data, dependencies);
+          return;
+        case 'chat.close':
+          await handleChatClose(ws, data, dependencies);
           return;
         case 'chat.stop-task':
           await handleChatStopTask(ws, data, dependencies);

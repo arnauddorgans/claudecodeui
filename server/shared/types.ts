@@ -245,7 +245,8 @@ export type GatewayEventKind =
   | 'loading_progress'
   | 'protocol_error'
   | 'side_question'
-  | 'scheduled_messages_changed';
+  | 'scheduled_messages_changed'
+  | 'session_process';
 
 /**
  * Complete set of `kind` values emitted to websocket clients.
@@ -596,6 +597,54 @@ export type BackgroundTaskSummary = {
    * it can still be stopped; not counted as the session's own work.
    */
   nested?: boolean;
+};
+
+/**
+ * Where a session's process lives, under `SESSION_PROCESS_CLOSE=manual`: in a
+ * chat process the provider runtime keeps between turns, in a `/shell`
+ * terminal with the provider's CLI resumed inside, or nowhere.
+ */
+export type SessionProcessState = 'chat' | 'terminal' | 'off';
+
+/**
+ * One task a session's process ran, as the process record keeps it: the same
+ * SDK events `task_status` forwards, folded into a whole record that stays
+ * after the task ended, so a client arriving later still sees what finished.
+ * Statuses: `started`, `running`, `completed`, `failed`, `stopped`.
+ */
+export type SessionProcessTask = {
+  taskId: string;
+  toolUseId?: string;
+  taskType?: string;
+  description: string;
+  status: string;
+  background: true;
+  summary?: string;
+  usage?: TaskUsage;
+  startedAt: number;
+  endedAt?: number;
+  nested?: boolean;
+};
+
+/**
+ * A session's process: what `session_process` broadcasts, what
+ * `chat_subscribed.process` carries and what `/sessions/running` lists as
+ * `processes`. `since` is epoch milliseconds; `turnActive` says whether a turn
+ * is open on it.
+ */
+export type SessionProcessSnapshot = {
+  sessionId: string;
+  provider: LLMProvider;
+  state: SessionProcessState;
+  since: number;
+  providerSessionId: string | null;
+  turnActive: boolean;
+  tasks: SessionProcessTask[];
+};
+
+export type SessionProcessEvent = SessionProcessSnapshot & {
+  kind: 'session_process';
+  timestamp: string;
 };
 
 /**

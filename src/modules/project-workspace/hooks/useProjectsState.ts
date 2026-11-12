@@ -779,6 +779,8 @@ export function useProjectsState({
         && event.kind !== 'session_upserted'
         // A change to the session's scheduled messages is not new activity in it.
         && event.kind !== 'scheduled_messages_changed'
+        // Where a session's process lives (SESSION_PROCESS_CLOSE=manual) is no news in it either.
+        && event.kind !== 'session_process'
         && event.kind !== 'status'
         && event.kind !== 'stream_end'
         && event.kind !== 'permission_resolved'

@@ -261,6 +261,9 @@ export function useChatRealtimeHandlers({
         // Owned by useScheduledMessages, which reads the composer banner's
         // list again. Not a transcript row.
         case 'scheduled_messages_changed':
+        // A process snapshot (SESSION_PROCESS_CLOSE=manual), not a message: it
+        // has no `id`, and the reconciliation of live rows reads one on each.
+        case 'session_process':
           return;
 
         default:
