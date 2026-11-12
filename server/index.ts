@@ -17,6 +17,7 @@ import {
     reapOrphanedOpenCodeServers,
 } from '@/modules/providers/index.js';
 import { chatRunRegistry, createWebSocketServer } from '@/modules/websocket/index.js';
+import type { LLMProvider } from '@/shared/types.js';
 
 import { getConnectableHost } from '../shared/networkHosts.js';
 
@@ -113,6 +114,9 @@ createWebSocketServer(server, {
         runtime: providerRuntimeService,
     },
     shell: {
+        // A terminal resuming a session takes it over from its chat process
+        // (SESSION_PROCESS_CLOSE=manual).
+        closeChatProcess: (provider, sessionId) => providerRuntimeService.close(provider as LLMProvider, sessionId),
         resolveProviderSessionId: (sessionId, provider) => {
             const dbSession = sessionsDb.getSessionById(sessionId);
             if (dbSession) {

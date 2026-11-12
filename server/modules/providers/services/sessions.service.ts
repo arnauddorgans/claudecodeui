@@ -3,7 +3,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
-import { broadcastSessionUpserted, chatRunRegistry } from '@/modules/websocket/index.js';
+import { broadcastSessionUpserted, chatRunRegistry, sessionProcessRegistry } from '@/modules/websocket/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { listBusyClaudeCliSessions } from '@/modules/providers/services/claude-cli-liveness.service.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
@@ -214,10 +214,13 @@ export const sessionsService = {
 
   /**
    * The session processes alive under `SESSION_PROCESS_CLOSE=manual`, every
-   * provider's: what `/sessions/running` lists as `processes`.
+   * provider's chat processes and the terminals: what `/sessions/running`
+   * lists as `processes`.
    */
   listSessionProcesses(): SessionProcessSnapshot[] {
-    return providerRegistry.listProviders().flatMap((provider) => provider.runtime.processes?.list() ?? []);
+    return sessionProcessRegistry.list(
+      providerRegistry.listProviders().flatMap((provider) => provider.runtime.processes?.list() ?? []),
+    );
   },
 
   /**

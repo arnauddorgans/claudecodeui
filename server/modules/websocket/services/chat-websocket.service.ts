@@ -12,6 +12,8 @@ import {
   sideQuestionsService,
 } from '@/modules/providers/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
+import { sessionProcessRegistry } from '@/modules/websocket/services/session-process-registry.service.js';
+import { closeTerminalSession } from '@/modules/websocket/services/shell-websocket.service.js';
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import {
   getGlobalImageAssetsDir,
@@ -30,6 +32,7 @@ import type {
   SideQuestionEvent,
   SideQuestionRuntime,
 } from '@/shared/types.js';
+import { resolveSessionProcessClose } from '@/shared/session-process-close.js';
 import { parseIncomingJsonObject, SIDE_QUESTION_ID_PATTERN } from '@/shared/utils.js';
 
 /**
@@ -173,7 +176,7 @@ async function handleChatSend(
   dependencies: ChatWebSocketDependencies
 ): Promise<void> {
   const resolved = resolveSendTarget(ws, data, dependencies, 'chat.send');
-  if (!resolved) {
+  if (!resolved || refusedInTerminal(ws, resolved.sessionId)) {
     return;
   }
 
@@ -220,6 +223,29 @@ function resolveSendTarget(
   }
 
   return { sessionId, session, provider };
+}
+
+/**
+ * Whether the session lives in a terminal, under `SESSION_PROCESS_CLOSE=manual`:
+ * its CLI resumed there cannot share the transcript with a chat process, so a
+ * turn from the chat is refused with `SESSION_IN_TERMINAL` until `chat.close`
+ * ends the terminal.
+ */
+function isInTerminal(sessionId: string): boolean {
+  return resolveSessionProcessClose() === 'manual' && sessionProcessRegistry.isInTerminal(sessionId);
+}
+
+function refusedInTerminal(ws: WebSocket, sessionId: string): boolean {
+  if (!isInTerminal(sessionId)) {
+    return false;
+  }
+  sendProtocolError(
+    ws,
+    'SESSION_IN_TERMINAL',
+    `Session "${sessionId}" is open in a terminal. Close it before sending from the chat.`,
+    sessionId
+  );
+  return true;
 }
 
 /**
@@ -503,7 +529,7 @@ async function handleChatEditSend(
   dependencies: ChatWebSocketDependencies
 ): Promise<void> {
   const resolved = resolveSendTarget(ws, data, dependencies, 'chat.edit-send');
-  if (!resolved) {
+  if (!resolved || refusedInTerminal(ws, resolved.sessionId)) {
     return;
   }
 
@@ -726,6 +752,8 @@ async function handleChatClose(
   const run = chatRunRegistry.getRun(sessionId);
   const wasRunning = run?.status === 'running';
   await dependencies.runtime.close?.(provider, sessionId);
+  // A session lives in its chat process or in a terminal, never both.
+  closeTerminalSession(sessionId);
   if (run && wasRunning) {
     chatRunRegistry.completeRunIfCurrent(run, { exitCode: 0, aborted: true });
   }
@@ -845,7 +873,7 @@ function handleChatSubscribe(
       // Where the session's process lives, on a server that keeps one between
       // turns; absent elsewhere.
       ...(dependencies.runtime.getSessionProcess
-        ? { process: dependencies.runtime.getSessionProcess(sessionId) }
+        ? { process: sessionProcessRegistry.get(sessionId, dependencies.runtime.getSessionProcess) }
         : {}),
       timestamp: new Date().toISOString(),
     });
@@ -934,6 +962,9 @@ export async function runDetachedChatTurn(
   const provider = session.provider as LLMProvider;
   if (!dependencies.runtime.hasRuntime(provider)) {
     return { started: false, error: `Provider "${provider}" is not available.` };
+  }
+  if (isInTerminal(input.sessionId)) {
+    return { started: false, error: 'The session is open in a terminal.' };
   }
 
   const activeRun = chatRunRegistry.getRun(input.sessionId);
