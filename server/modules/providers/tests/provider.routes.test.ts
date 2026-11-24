@@ -11,6 +11,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import providerRouter from '@/modules/providers/provider.routes.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
+import { SESSION_MCP_TIMEOUTS } from '@/modules/providers/services/sessions.service.js';
 import type { IProvider } from '@/shared/interfaces.js';
 import type { BackgroundTaskSummary, WorkflowAgentActivity } from '@/shared/types.js';
 import { AppError, IS_PLATFORM } from '@/shared/utils.js';
@@ -501,6 +502,122 @@ test('the session commands route answers from the live process, never starting o
       assert.deepEqual(Object.fromEntries(listed), { claude: true, cursor: false, codex: false, opencode: false });
     });
   } finally {
+    providerRegistry.resolveProvider = realResolveProvider;
+  }
+});
+
+test('the session MCP routes answer from the live process, validate names and bodies, and map every outcome', async () => {
+  const realResolveProvider = providerRegistry.resolveProvider;
+  const realTimeouts = { ...SESSION_MCP_TIMEOUTS };
+  const github = { name: 'github', status: 'connected', scope: 'user', type: 'stdio', toolCount: 2 };
+  const changes: Array<[string, string, unknown]> = [];
+  let live = true;
+  let hang = false;
+  let next: Record<string, unknown> = { outcome: 'done', server: github, updatedAt: 1_700_000_000_001 };
+  providerRegistry.resolveProvider = ((provider: string) => ({
+    id: provider,
+    runtime: {
+      processes: {
+        mcp: async () => {
+          if (hang) {
+            return new Promise(() => {});
+          }
+          return live ? { servers: [github], updatedAt: 1_700_000_000_000 } : null;
+        },
+        changeMcp: async (sessionId: string, name: string, change: unknown, timeouts: unknown) => {
+          changes.push([sessionId, name, change]);
+          assert.deepEqual(timeouts, { statusMs: 10_000, changeMs: 30_000 }, 'the contract bounds reach the runtime');
+          return next;
+        },
+      },
+    },
+  })) as unknown as typeof providerRegistry.resolveProvider;
+
+  type Envelope = { data?: unknown; error?: { code: string; message: string } };
+  try {
+    await withProviderServer(async (baseUrl, workspacePath) => {
+      sessionsDb.createAppSession('mcp-session', 'claude', workspacePath);
+      sessionsDb.assignProviderSessionId('mcp-session', 'mcp-provider-id');
+      const call = async (method: string, route: string, body?: unknown) => {
+        const response = await fetch(`${baseUrl}/api/providers/sessions/${route}`, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        return { status: response.status, payload: (await response.json()) as Envelope };
+      };
+
+      for (const id of ['mcp-session', 'mcp-provider-id']) {
+        const listed = await call('GET', `${id}/mcp`);
+        assert.equal(listed.status, 200, id);
+        assert.deepEqual(listed.payload.data, { servers: [github], updatedAt: 1_700_000_000_000, source: 'session', sessionId: 'mcp-session' });
+      }
+
+      const reconnected = await call('POST', 'mcp-provider-id/mcp/github/reconnect');
+      assert.equal(reconnected.status, 200);
+      assert.deepEqual(reconnected.payload.data, { server: github, updatedAt: 1_700_000_000_001 });
+      const toggled = await call('POST', `mcp-session/mcp/${encodeURIComponent('claude.ai Linear')}/toggle`, { enabled: false });
+      assert.equal(toggled.status, 200);
+      assert.deepEqual(changes, [
+        ['mcp-session', 'github', { action: 'reconnect' }],
+        ['mcp-session', 'claude.ai Linear', { action: 'toggle', enabled: false }],
+      ], 'keyed by the app id, the name decoded');
+
+      for (const body of [undefined, {}, { enabled: 'yes' }, { enabled: null }, [true]]) {
+        const bad = await call('POST', 'mcp-session/mcp/github/toggle', body);
+        assert.equal(bad.status, 400, JSON.stringify(body));
+      }
+      // (`..` itself never gets here: a URL resolves it before it is sent.)
+      for (const name of ['%2Fetc%2Fpasswd', 'a%5Cb', 'a%0Ab', 'a%00b', '%20github', 'x'.repeat(201)]) {
+        const bad = await call('POST', `mcp-session/mcp/${name}/reconnect`);
+        assert.equal(bad.status, 400, name);
+        assert.equal(bad.payload.error?.code, 'INVALID_MCP_SERVER_NAME', name);
+      }
+      assert.equal(changes.length, 2, 'no bad request reached the process');
+
+      const outcomes: Array<[Record<string, unknown>, number, string]> = [
+        [{ outcome: 'not-running' }, 409, 'SESSION_PROCESS_NOT_RUNNING'],
+        [{ outcome: 'not-found' }, 404, 'MCP_SERVER_NOT_FOUND'],
+        [{ outcome: 'timeout', step: 'change' }, 504, 'SESSION_MCP_TIMEOUT'],
+        [{ outcome: 'failed', message: 'spawn --token=[redacted] failed' }, 502, 'MCP_RECONNECT_FAILED'],
+      ];
+      for (const [outcome, status, code] of outcomes) {
+        next = outcome;
+        const answer = await call('POST', 'mcp-session/mcp/github/reconnect');
+        assert.equal(answer.status, status, code);
+        assert.equal(answer.payload.error?.code, code);
+      }
+      assert.equal((await call('POST', 'mcp-session/mcp/github/reconnect')).payload.error?.message, 'spawn --token=[redacted] failed',
+        'the redacted SDK message is the error');
+      const toggleFailed = await call('POST', 'mcp-session/mcp/github/toggle', { enabled: true });
+      assert.equal(toggleFailed.status, 502);
+      assert.equal(toggleFailed.payload.error?.code, 'MCP_TOGGLE_FAILED');
+
+      live = false;
+      const idle = await call('GET', 'mcp-session/mcp');
+      assert.equal(idle.status, 409);
+      assert.equal(idle.payload.error?.code, 'SESSION_PROCESS_NOT_RUNNING');
+
+      hang = true;
+      SESSION_MCP_TIMEOUTS.statusMs = 50;
+      const hung = await call('GET', 'mcp-session/mcp');
+      assert.equal(hung.status, 504);
+      assert.equal(hung.payload.error?.code, 'SESSION_MCP_TIMEOUT');
+      Object.assign(SESSION_MCP_TIMEOUTS, realTimeouts);
+
+      for (const route of ['no-such-session/mcp', 'no-such-session/mcp/github/reconnect']) {
+        const unknown = await call(route.endsWith('mcp') ? 'GET' : 'POST', route);
+        assert.equal(unknown.status, 404, route);
+        assert.equal(unknown.payload.error?.code, 'SESSION_NOT_FOUND', route);
+      }
+
+      const capabilities = await fetch(`${baseUrl}/api/providers/capabilities`);
+      const listed = ((await capabilities.json()) as { data: { providers: Array<{ provider: string; supportsSessionMcp: boolean }> } })
+        .data.providers.map(({ provider, supportsSessionMcp }) => [provider, supportsSessionMcp]);
+      assert.deepEqual(Object.fromEntries(listed), { claude: true, cursor: false, codex: false, opencode: false });
+    });
+  } finally {
+    Object.assign(SESSION_MCP_TIMEOUTS, realTimeouts);
     providerRegistry.resolveProvider = realResolveProvider;
   }
 });

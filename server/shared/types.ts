@@ -649,6 +649,13 @@ export type SessionProcessSnapshot = {
    * `GET /sessions/:id/commands` answers has changed.
    */
   commandsVersion?: number;
+  /**
+   * How many times the process's MCP servers changed since it started: a
+   * turn's `init` reporting another name or status than the one before, or a
+   * reconnect or toggle through `/sessions/:id/mcp`. Absent until the first
+   * change; a change means `GET /sessions/:id/mcp` answers something new.
+   */
+  mcpVersion?: number;
 };
 
 /** One slash command of a live session, as its CLI lists it. */
@@ -666,6 +673,46 @@ export type SessionCommandsSnapshot = {
   commands: SessionCommand[];
   updatedAt: number;
 };
+
+/**
+ * One MCP server of a live session, as the client may see it: never its
+ * configuration (env values, headers, URLs and arguments carry secrets), and
+ * an error message only once redacted.
+ */
+export type SessionMcpServer = {
+  name: string;
+  /** `connected`, `failed`, `needs-auth`, `pending` or `disabled`; a newer CLI may add more. */
+  status: string;
+  error?: string;
+  serverInfo?: { name: string; version: string };
+  scope?: string;
+  /** The transport: `stdio`, `http`, `sse`, `sdk`, `claudeai-proxy`, … */
+  type?: string;
+  toolCount?: number;
+};
+
+/** The MCP servers of a session's live process, read when asked (epoch ms). */
+export type SessionMcpSnapshot = {
+  servers: SessionMcpServer[];
+  updatedAt: number;
+};
+
+/** What a session's MCP server is asked to do. */
+export type SessionMcpChange = { action: 'reconnect' } | { action: 'toggle'; enabled: boolean };
+
+/**
+ * How a reconnect or toggle ended: done (with the server read again
+ * afterwards), or why it was not done.
+ */
+export type SessionMcpChangeOutcome =
+  | { outcome: 'done'; server: SessionMcpServer; updatedAt: number }
+  | { outcome: 'not-running' }
+  | { outcome: 'not-found' }
+  | { outcome: 'failed'; message: string }
+  | { outcome: 'timeout'; step: 'status' | 'change' };
+
+/** The bounds a reconnect or toggle runs under, each step on its own. */
+export type SessionMcpTimeouts = { statusMs: number; changeMs: number };
 
 /**
  * The latest of each live activity frame of the turn under way (`status`
@@ -890,6 +937,10 @@ export type ProviderRuntimeContext = {
     stopTask?(taskId: string): Promise<void>;
     /** The CLI's slash commands: its `initialize` answer, or the latest `commands_changed` push. */
     supportedCommands?(): Promise<Array<Partial<SessionCommand> & { name: string }>>;
+    /** The CLI's MCP servers (`mcp_status`); each row may carry its config, secrets included. */
+    mcpServerStatus?(): Promise<AnyRecord[]>;
+    reconnectMcpServer?(serverName: string): Promise<void>;
+    toggleMcpServer?(serverName: string, enabled: boolean): Promise<void>;
   };
 };
 

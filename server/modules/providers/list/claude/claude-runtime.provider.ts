@@ -29,6 +29,7 @@ import {
   CLAUDE_ULTRACODE_EFFORT
 } from '@/modules/providers/list/claude/claude-models.provider.js';
 import { createActivityRecorder, readClaudeActivityFrame } from '@/modules/providers/list/claude/claude-activity.js';
+import { describeMcpServers, mcpFingerprint, redactMcpMessage } from '@/modules/providers/list/claude/claude-mcp-status.js';
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import { askClaudeSideQuestion } from '@/modules/providers/list/claude/claude-side-question.provider.js';
 import {
@@ -52,6 +53,10 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimeWriter,
   SessionCommandsSnapshot,
+  SessionMcpChange,
+  SessionMcpChangeOutcome,
+  SessionMcpSnapshot,
+  SessionMcpTimeouts,
   SessionProcessActivity,
   SessionProcessSnapshot,
   SessionProcessState,
@@ -199,6 +204,11 @@ type SessionProcess = {
   /** `commands_changed` pushes received, and when the list last changed (epoch ms). */
   commandsVersion: number;
   commandsUpdatedAt: number;
+  /** MCP changes seen (`init` lists, reconnects, toggles), and the names and statuses last seen. */
+  mcpVersion: number;
+  mcpFingerprint: string | null;
+  /** The tail of the reconnects and toggles: one at a time per process. */
+  mcpQueue: Promise<void>;
   /** Settles once the run loop has ended. */
   exited: Promise<void>;
   /** Writes the next turn into the process; resolves when that turn has ended. */
@@ -298,6 +308,7 @@ function describeProcess(proc: SessionProcess, state: SessionProcessState = 'cha
     ...(state === 'chat' && proc.turnActive && proc.activity ? { activity: { ...proc.activity } } : {}),
     tasks: Array.from(proc.tasks.values(), (task) => ({ ...task })),
     ...(proc.commandsVersion > 0 ? { commandsVersion: proc.commandsVersion } : {}),
+    ...(proc.mcpVersion > 0 ? { mcpVersion: proc.mcpVersion } : {}),
   };
 }
 
@@ -411,6 +422,121 @@ async function getSessionCommands(sessionId: string): Promise<SessionCommandsSna
     })),
     updatedAt: proc.commandsUpdatedAt,
   };
+}
+
+/**
+ * The MCP servers of a session's live process, as the CLI reports them now
+ * (`mcp_status`), stripped of their configuration. No request reaches the
+ * model.
+ */
+async function getSessionMcp(sessionId: string): Promise<SessionMcpSnapshot | null> {
+  const proc = sessionProcesses.get(sessionId);
+  if (!proc || proc.closing || typeof proc.instance.mcpServerStatus !== 'function') {
+    return null;
+  }
+  const rows = await proc.instance.mcpServerStatus();
+  return { servers: describeMcpServers(rows), updatedAt: Date.now() };
+}
+
+/** A step of an MCP change that ran out of time. */
+class McpStepTimeout extends Error {
+  constructor(readonly step: 'status' | 'change') {
+    super(`MCP ${step} timed out`);
+  }
+}
+
+/** `work`, or a `McpStepTimeout` once `ms` have passed: a hung CLI must not hold the queue. */
+async function bounded<T>(work: Promise<T>, ms: number, step: 'status' | 'change'): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new McpStepTimeout(step)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Tells clients the process's MCP servers changed. */
+function bumpMcpVersion(proc: SessionProcess): void {
+  proc.mcpVersion += 1;
+  if (!proc.closing) {
+    emitProcessChange(proc);
+  }
+}
+
+async function applyMcpChange(
+  proc: SessionProcess,
+  serverName: string,
+  change: SessionMcpChange,
+  timeouts: SessionMcpTimeouts,
+): Promise<SessionMcpChangeOutcome> {
+  const { instance } = proc;
+  if (
+    proc.closing
+    || typeof instance.mcpServerStatus !== 'function'
+    || typeof instance.reconnectMcpServer !== 'function'
+    || typeof instance.toggleMcpServer !== 'function'
+  ) {
+    return { outcome: 'not-running' };
+  }
+  try {
+    const before = describeMcpServers(await bounded(instance.mcpServerStatus(), timeouts.statusMs, 'status'));
+    if (!before.some((server) => server.name === serverName)) {
+      return { outcome: 'not-found' };
+    }
+    if (proc.closing) {
+      return { outcome: 'not-running' };
+    }
+    try {
+      await bounded(
+        change.action === 'reconnect'
+          ? instance.reconnectMcpServer(serverName)
+          : instance.toggleMcpServer(serverName, change.enabled),
+        timeouts.changeMs,
+        'change',
+      );
+    } catch (error) {
+      bumpMcpVersion(proc);
+      if (error instanceof McpStepTimeout) {
+        throw error;
+      }
+      return { outcome: 'failed', message: redactMcpMessage(String((error as Error)?.message ?? error)) };
+    }
+    const rows = await bounded(instance.mcpServerStatus(), timeouts.statusMs, 'status');
+    const server = describeMcpServers(rows).find((candidate) => candidate.name === serverName);
+    // The next turn's `init` listing what this read did is no news.
+    proc.mcpFingerprint = mcpFingerprint(rows);
+    bumpMcpVersion(proc);
+    return server ? { outcome: 'done', server, updatedAt: Date.now() } : { outcome: 'not-found' };
+  } catch (error) {
+    if (error instanceof McpStepTimeout) {
+      return { outcome: 'timeout', step: error.step };
+    }
+    if (proc.closing) {
+      return { outcome: 'not-running' };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Reconnects or toggles one MCP server of a session's live process: checks
+ * the name against the CLI's own list, sends the change, then reads that
+ * server's status again. Changes to one process run one at a time, each step
+ * bounded, so a hung CLI delays the next change by at most its bounds. Never
+ * starts a process and sends no turn.
+ */
+async function changeSessionMcp(
+  sessionId: string,
+  serverName: string,
+  change: SessionMcpChange,
+  timeouts: SessionMcpTimeouts,
+): Promise<SessionMcpChangeOutcome> {
+  const proc = sessionProcesses.get(sessionId);
+  if (!proc || proc.closing) {
+    return { outcome: 'not-running' };
+  }
+  const run = proc.mcpQueue.then(() => applyMcpChange(proc, serverName, change, timeouts));
+  proc.mcpQueue = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 function listSessionProcesses(): SessionProcessSnapshot[] {
@@ -2109,6 +2235,9 @@ async function runClaudeQuery(
         tasks: new Map(),
         commandsVersion: 0,
         commandsUpdatedAt: Date.now(),
+        mcpVersion: 0,
+        mcpFingerprint: null,
+        mcpQueue: Promise.resolve(),
         exited: processExited,
         takeTurn,
         interruptTurn,
@@ -2387,6 +2516,19 @@ async function runClaudeQuery(
         proc.commandsUpdatedAt = Date.now();
         if (!proc.closing) {
           emitProcessChange(proc);
+        }
+      }
+      // The SDK pushes no MCP status change of its own; each turn's `init`
+      // lists the servers' names and statuses, and a different list than the
+      // last one says to refetch. The first list is the baseline.
+      if (proc && message.type === 'system' && message.subtype === 'init') {
+        const fingerprint = mcpFingerprint(message.mcp_servers);
+        if (fingerprint !== null && fingerprint !== proc.mcpFingerprint) {
+          const known = proc.mcpFingerprint !== null;
+          proc.mcpFingerprint = fingerprint;
+          if (known) {
+            bumpMcpVersion(proc);
+          }
         }
       }
       if (proc) {
@@ -2922,6 +3064,8 @@ export const claudeRuntime = {
     onSelfStartedTurn,
     closeAll: closeAllClaudeSDKSessions,
     commands: getSessionCommands,
+    mcp: getSessionMcp,
+    changeMcp: changeSessionMcp,
   },
 };
 
@@ -2944,6 +3088,8 @@ export {
   closeAllClaudeSDKSessions,
   getSessionProcess,
   getSessionCommands,
+  getSessionMcp,
+  changeSessionMcp,
   listSessionProcesses,
   onSessionProcessChange,
   onSelfStartedTurn,

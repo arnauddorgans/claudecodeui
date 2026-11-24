@@ -19,6 +19,10 @@ import type {
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
   SessionCommandsSnapshot,
+  SessionMcpChange,
+  SessionMcpChangeOutcome,
+  SessionMcpSnapshot,
+  SessionMcpTimeouts,
   SessionProcessSnapshot,
   SideQuestionOutcome,
   SideQuestionRequest,
@@ -114,6 +118,21 @@ export interface IProviderSessionProcesses {
    * or running a turn. Null when the session has no live process.
    */
   commands?(sessionId: string): Promise<SessionCommandsSnapshot | null>;
+  /**
+   * The MCP servers of the session's live process, without their
+   * configuration. Null when the session has no live process.
+   */
+  mcp?(sessionId: string): Promise<SessionMcpSnapshot | null>;
+  /**
+   * Reconnects or toggles one MCP server of the session's live process, one
+   * change at a time per process, each step bounded by `timeouts`.
+   */
+  changeMcp?(
+    sessionId: string,
+    serverName: string,
+    change: SessionMcpChange,
+    timeouts: SessionMcpTimeouts,
+  ): Promise<SessionMcpChangeOutcome>;
 }
 
 /**

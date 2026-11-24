@@ -170,6 +170,46 @@ const parseMcpTransport = (value: unknown): McpTransport => {
   });
 };
 
+/**
+ * An MCP server name as Claude Code keys it ("github", "claude.ai Linear",
+ * "plugin:x:y"): 1–200 characters, no control characters, no path separator,
+ * no surrounding whitespace, not a dot path.
+ */
+const parseSessionMcpServerName = (value: unknown): string => {
+  const name = readPathParam(value, 'name');
+  if (
+    name.length === 0
+    || name.length > 200
+    || name !== name.trim()
+    || name === '.'
+    || name === '..'
+    || /[\u0000-\u001f\u007f/\\]/.test(name)
+  ) {
+    throw new AppError('Invalid MCP server name.', {
+      code: 'INVALID_MCP_SERVER_NAME',
+      statusCode: 400,
+    });
+  }
+  return name;
+};
+
+const parseMcpTogglePayload = (payload: unknown): boolean => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new AppError('Request body must be an object.', {
+      code: 'INVALID_REQUEST_BODY',
+      statusCode: 400,
+    });
+  }
+  const { enabled } = payload as Record<string, unknown>;
+  if (typeof enabled !== 'boolean') {
+    throw new AppError('enabled must be a boolean.', {
+      code: 'INVALID_MCP_TOGGLE',
+      statusCode: 400,
+    });
+  }
+  return enabled;
+};
+
 const parseMcpUpsertPayload = (payload: unknown): UpsertProviderMcpServerInput => {
   if (!payload || typeof payload !== 'object') {
     throw new AppError('Request body must be an object.', {
@@ -955,6 +995,35 @@ router.get(
   asyncHandler(async (req: Request, res: Response) => {
     const sessionId = parseSessionId(req.params.sessionId);
     res.json(createApiSuccessResponse(await sessionsService.getSessionCommands(sessionId)));
+  }),
+);
+
+// The live process's MCP servers, without their configuration; 409
+// SESSION_PROCESS_NOT_RUNNING without a process.
+router.get(
+  '/sessions/:sessionId/mcp',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    res.json(createApiSuccessResponse(await sessionsService.getSessionMcp(sessionId)));
+  }),
+);
+
+router.post(
+  '/sessions/:sessionId/mcp/:name/reconnect',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const name = parseSessionMcpServerName(req.params.name);
+    res.json(createApiSuccessResponse(await sessionsService.changeSessionMcp(sessionId, name, { action: 'reconnect' })));
+  }),
+);
+
+router.post(
+  '/sessions/:sessionId/mcp/:name/toggle',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const name = parseSessionMcpServerName(req.params.name);
+    const enabled = parseMcpTogglePayload(req.body);
+    res.json(createApiSuccessResponse(await sessionsService.changeSessionMcp(sessionId, name, { action: 'toggle', enabled })));
   }),
 );
 

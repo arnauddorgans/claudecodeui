@@ -6,8 +6,10 @@ import test from 'node:test';
 
 import {
   abortClaudeSDKSession,
+  changeSessionMcp,
   closeClaudeSDKSession,
   getSessionCommands,
+  getSessionMcp,
   getSessionProcess,
   listClaudeSDKBackgroundWork,
   onSessionProcessChange,
@@ -15,6 +17,7 @@ import {
   stopClaudeSDKTask,
 } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude-models.provider.js';
+import { redactMcpMessage } from '@/modules/providers/list/claude/claude-mcp-status.js';
 import type { AnyRecord, ProviderRuntimeContext, SessionProcessSnapshot } from '@/shared/types.js';
 
 /**
@@ -96,6 +99,43 @@ class FakeQuery {
   }
 
   async supportedCommands(): Promise<AnyRecord[]> { return this.commands; }
+
+  /** The CLI's `mcp_status` rows, configs and all, and what each control request did. */
+  mcp: AnyRecord[] = [];
+  mcpCalls: string[] = [];
+  /** Set: a reconnect or toggle waits on this before it applies. */
+  mcpGate: Promise<void> | null = null;
+  /** Set: a reconnect throws this instead of connecting. */
+  reconnectError: Error | null = null;
+
+  async mcpServerStatus(): Promise<AnyRecord[]> {
+    this.mcpCalls.push('status');
+    return this.mcp.map((row) => ({ ...row }));
+  }
+
+  async reconnectMcpServer(name: string): Promise<void> {
+    this.mcpCalls.push(`reconnect ${name}:start`);
+    await this.mcpGate;
+    this.mcpCalls.push(`reconnect ${name}:end`);
+    if (this.reconnectError) {
+      throw this.reconnectError;
+    }
+    const row = this.mcp.find((candidate) => candidate.name === name);
+    if (row) {
+      Object.assign(row, { status: 'connected', serverInfo: { name: `${name}-server`, version: '1.2.3' }, tools: [{ name: 'a' }, { name: 'b' }] });
+      delete row.error;
+    }
+  }
+
+  async toggleMcpServer(name: string, enabled: boolean): Promise<void> {
+    this.mcpCalls.push(`toggle ${name} ${enabled}:start`);
+    await this.mcpGate;
+    this.mcpCalls.push(`toggle ${name} ${enabled}:end`);
+    const row = this.mcp.find((candidate) => candidate.name === name);
+    if (row) {
+      row.status = enabled ? 'connected' : 'disabled';
+    }
+  }
 
   /** A turn as the CLI answers it: init, one assistant message, the result. */
   answer(sessionId: string): void {
@@ -543,4 +583,178 @@ test('the live process lists its slash commands, and a pushed list replaces them
   unsubscribe();
   await closeClaudeSDKSession('app-c');
   assert.equal(await getSessionCommands('app-c'), null, 'a closed process lists nothing');
+});
+
+/** A failing stdio server whose config is full of secrets, and a connected http one. */
+const secretMcpRows = (): AnyRecord[] => [
+  {
+    name: 'github',
+    status: 'failed',
+    scope: 'user',
+    error: 'spawn npx -y @x/github --token=ghp_abcdefghijklmnop -e GITHUB_TOKEN=s3cr3t-value failed: Authorization: Bearer sk-ant-abcdefghijkl',
+    config: { command: 'npx', args: ['--token=ghp_abcdefghijklmnop'], env: { GITHUB_TOKEN: 's3cr3t-value' } },
+  },
+  {
+    name: 'claude.ai Linear',
+    status: 'connected',
+    scope: 'claudeai',
+    serverInfo: { name: 'linear', version: '2.0.0' },
+    config: { type: 'http', url: 'https://alice:pa55word@mcp.example.com/sse?api_key=XYZ', headers: { Authorization: 'Bearer hdr-secret' } },
+    tools: [{ name: 'list_issues' }, { name: 'get_issue' }, { name: 'save_issue' }],
+  },
+];
+
+const MCP_TIMEOUTS = { statusMs: 1_000, changeMs: 1_000 };
+
+test('the live process reports its MCP servers without their configuration, and a changed init bumps mcpVersion', async () => {
+  const { context, queries } = createContext((query) => {
+    query.mcp = secretMcpRows();
+    let turn = 0;
+    query.onInput = () => {
+      turn += 1;
+      query.emit({ type: 'system', subtype: 'init', session_id: 'sid-m', mcp_servers: turn === 1
+        ? [{ name: 'github', status: 'failed' }, { name: 'claude.ai Linear', status: 'connected' }]
+        : turn === 2
+          ? [{ name: 'claude.ai Linear', status: 'connected' }, { name: 'github', status: 'failed' }]
+          : [{ name: 'github', status: 'needs-auth' }, { name: 'claude.ai Linear', status: 'connected' }] });
+      query.emit({ type: 'result', subtype: 'success', session_id: 'sid-m' });
+    };
+  });
+  const writer = createWriter();
+  const changes: SessionProcessSnapshot[] = [];
+  const unsubscribe = onSessionProcessChange((snapshot) => changes.push(snapshot));
+
+  assert.equal(await getSessionMcp('app-m'), null, 'no process, no list');
+  await queryClaudeSDK('hello', { sessionId: 'app-m' }, writer as never, context);
+
+  const snapshot = await getSessionMcp('app-m');
+  assert.deepEqual(snapshot?.servers, [
+    {
+      name: 'github',
+      status: 'failed',
+      scope: 'user',
+      type: 'stdio',
+      error: 'spawn npx -y @x/github --token=[redacted] -e GITHUB_TOKEN=[redacted] failed: Authorization: [redacted]',
+    },
+    { name: 'claude.ai Linear', status: 'connected', scope: 'claudeai', type: 'http', serverInfo: { name: 'linear', version: '2.0.0' }, toolCount: 3 },
+  ]);
+  const wire = JSON.stringify(snapshot);
+  for (const secret of ['ghp_', 's3cr3t', 'sk-ant', 'pa55word', 'XYZ', 'hdr-secret', 'mcp.example.com', 'config', 'env']) {
+    assert.equal(wire.includes(secret), false, `no ${secret} in ${wire}`);
+  }
+  assert.equal(getSessionProcess('app-m')?.mcpVersion, undefined, 'the first init is the baseline');
+
+  await queryClaudeSDK('same servers, other order', { sessionId: 'app-m' }, writer as never, context);
+  assert.equal(getSessionProcess('app-m')?.mcpVersion, undefined, 'the same names and statuses are no change');
+
+  await queryClaudeSDK('github needs auth now', { sessionId: 'app-m' }, writer as never, context);
+  assert.equal(getSessionProcess('app-m')?.mcpVersion, 1);
+  assert.equal(changes.at(-1)?.mcpVersion, 1, 'the change is announced');
+  assert.equal(queries.length, 1, 'no process started for any of it');
+
+  unsubscribe();
+  await closeClaudeSDKSession('app-m');
+  assert.equal(await getSessionMcp('app-m'), null, 'a closed process lists nothing');
+});
+
+test('a reconnect and a toggle change one server and answer it read again; failures and unknown names say so', async () => {
+  const { context, queries } = createContext((query) => {
+    query.mcp = secretMcpRows();
+    query.onInput = () => query.answer('sid-r');
+  });
+  const writer = createWriter();
+
+  assert.deepEqual(await changeSessionMcp('app-r', 'github', { action: 'reconnect' }, MCP_TIMEOUTS), { outcome: 'not-running' });
+  await queryClaudeSDK('hello', { sessionId: 'app-r' }, writer as never, context);
+  const query = queries[0];
+
+  const reconnected = await changeSessionMcp('app-r', 'github', { action: 'reconnect' }, MCP_TIMEOUTS);
+  assert.equal(reconnected.outcome, 'done');
+  assert.deepEqual(reconnected.outcome === 'done' && reconnected.server, {
+    name: 'github', status: 'connected', scope: 'user', type: 'stdio', serverInfo: { name: 'github-server', version: '1.2.3' }, toolCount: 2,
+  });
+  assert.deepEqual(query.mcpCalls, ['status', 'reconnect github:start', 'reconnect github:end', 'status'], 'checked, changed, read again');
+  assert.equal(getSessionProcess('app-r')?.mcpVersion, 1, 'other clients learn of it');
+
+  const off = await changeSessionMcp('app-r', 'claude.ai Linear', { action: 'toggle', enabled: false }, MCP_TIMEOUTS);
+  assert.equal(off.outcome === 'done' && off.server.status, 'disabled');
+  const on = await changeSessionMcp('app-r', 'claude.ai Linear', { action: 'toggle', enabled: true }, MCP_TIMEOUTS);
+  assert.equal(on.outcome === 'done' && on.server.status, 'connected');
+  assert.equal(getSessionProcess('app-r')?.mcpVersion, 3);
+
+  query.mcpCalls.length = 0;
+  assert.deepEqual(await changeSessionMcp('app-r', 'nope', { action: 'reconnect' }, MCP_TIMEOUTS), { outcome: 'not-found' });
+  assert.deepEqual(query.mcpCalls, ['status'], 'an unknown name never reaches the CLI as a change');
+
+  query.reconnectError = new Error('MCP server "github" failed: spawn npx --api-key=abc123 -e API_TOKEN=zzz https://u:p@host/x?token=q');
+  const failed = await changeSessionMcp('app-r', 'github', { action: 'reconnect' }, MCP_TIMEOUTS);
+  assert.deepEqual(failed, {
+    outcome: 'failed',
+    message: 'MCP server "github" failed: spawn npx --api-key=[redacted] -e API_TOKEN=[redacted] https://[redacted]@host/x?[redacted]',
+  });
+
+  assert.equal(queries.length, 1, 'no process started');
+  assert.equal(query.consumed.length, 1, 'and no turn sent');
+  await closeClaudeSDKSession('app-r');
+  assert.deepEqual(await changeSessionMcp('app-r', 'github', { action: 'reconnect' }, MCP_TIMEOUTS), { outcome: 'not-running' });
+});
+
+test('changes to one process run one at a time, and a hung CLI times out without holding the next', async () => {
+  const { context, queries } = createContext((query) => {
+    query.mcp = secretMcpRows();
+    query.onInput = () => query.answer('sid-s');
+  });
+  await queryClaudeSDK('hello', { sessionId: 'app-s' }, createWriter() as never, context);
+  const query = queries[0];
+
+  let open!: () => void;
+  query.mcpGate = new Promise<void>((resolve) => { open = resolve; });
+  const first = changeSessionMcp('app-s', 'github', { action: 'reconnect' }, MCP_TIMEOUTS);
+  const second = changeSessionMcp('app-s', 'claude.ai Linear', { action: 'toggle', enabled: false }, MCP_TIMEOUTS);
+  await until(() => query.mcpCalls.includes('reconnect github:start'));
+  await tick(30);
+  assert.deepEqual(query.mcpCalls, ['status', 'reconnect github:start'], 'the toggle waits for the reconnect');
+  open();
+  assert.equal((await first).outcome, 'done');
+  assert.equal((await second).outcome, 'done');
+  assert.deepEqual(query.mcpCalls, [
+    'status', 'reconnect github:start', 'reconnect github:end', 'status',
+    'status', 'toggle claude.ai Linear false:start', 'toggle claude.ai Linear false:end', 'status',
+  ]);
+
+  // A reconnect that never answers: the request ends at the bound, and the queue moves on.
+  query.mcpGate = new Promise<void>(() => {});
+  const started = Date.now();
+  const hung = await changeSessionMcp('app-s', 'github', { action: 'reconnect' }, { statusMs: 1_000, changeMs: 50 });
+  assert.deepEqual(hung, { outcome: 'timeout', step: 'change' });
+  assert.ok(Date.now() - started < 1_000, 'bounded by changeMs');
+  query.mcpGate = null;
+  const next = await changeSessionMcp('app-s', 'claude.ai Linear', { action: 'toggle', enabled: true }, MCP_TIMEOUTS);
+  assert.equal(next.outcome === 'done' && next.server.status, 'connected', 'the next change is not held');
+
+  await closeClaudeSDKSession('app-s');
+});
+
+test('an MCP error message loses what may be a secret, and keeps what explains the failure', () => {
+  const cases: Array<[string, string]> = [
+    ['Failed to connect to https://alice:s3cret@mcp.example.com/v1/sse?api_key=XYZ&x=1#frag',
+      'Failed to connect to https://[redacted]@mcp.example.com/v1/sse?[redacted]'],
+    ['HTTP 401: {"error":"invalid","Authorization":"Bearer sk-ant-abcdefghijk"}',
+      'HTTP 401: {"error":"invalid","Authorization":[redacted]}'],
+    ['request with header Authorization: Bearer abc.def.ghi rejected', 'request with header Authorization: [redacted]'],
+    ['token rejected: Bearer abcdef123456', 'token rejected: Bearer [redacted]'],
+    ['docker run -e API_KEY=hunter2 --env "SECRET=x y" image', 'docker run -e API_KEY=[redacted] --env SECRET=[redacted] image'],
+    ['spawn server --token=abc123 key=value password: hunter2 "client_secret": "abc"',
+      'spawn server --token=[redacted] key=[redacted] password: [redacted] "client_secret": [redacted]'],
+    ['GITHUB_PERSONAL_ACCESS_TOKEN=ghp_abcdefghijklmnop npx server', 'GITHUB_PERSONAL_ACCESS_TOKEN=[redacted] npx server'],
+    ['stray ghp_abcdefghijklmnop and xoxb-1234567890-abcdef', 'stray [redacted] and [redacted]'],
+    ["ENOENT: no such file or directory, posix_spawn 'stdio'", "ENOENT: no such file or directory, posix_spawn 'stdio'"],
+    ['Not authenticated - your API key is missing (x-api-key / Bearer)', 'Not authenticated - your API key is missing (x-api-key / Bearer)'],
+    ['Connection closed', 'Connection closed'],
+  ];
+  for (const [message, expected] of cases) {
+    assert.equal(redactMcpMessage(message), expected, message);
+  }
+  assert.ok(redactMcpMessage('x'.repeat(2_000)).length <= 501, 'bounded');
+  assert.equal(redactMcpMessage('a\u0000b\u001bc'), 'a b c', 'no control characters');
 });

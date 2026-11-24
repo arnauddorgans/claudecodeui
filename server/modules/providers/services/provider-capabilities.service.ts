@@ -59,6 +59,11 @@ type ProviderCapabilities = {
    * commands, read from the process the session keeps between turns.
    */
   supportsSessionCommands: boolean;
+  /**
+   * Whether `/sessions/:id/mcp` can list a live session's MCP servers and
+   * reconnect or toggle one, through the process the session keeps.
+   */
+  supportsSessionMcp: boolean;
 };
 
 /**
@@ -90,6 +95,8 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
     supportsSteering: true,
     // The SDK keeps the CLI's command list on the session's query.
     supportsSessionCommands: true,
+    // The SDK's query answers `mcp_status`, `mcp_reconnect` and `mcp_toggle`.
+    supportsSessionMcp: true,
   },
   cursor: {
     provider: 'cursor',
@@ -107,6 +114,7 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
     supportsSideQuestions: false,
     supportsSteering: false,
     supportsSessionCommands: false,
+    supportsSessionMcp: false,
   },
   codex: {
     provider: 'codex',
@@ -128,6 +136,7 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
     supportsSideQuestions: true,
     supportsSteering: false,
     supportsSessionCommands: false,
+    supportsSessionMcp: false,
   },
   opencode: {
     provider: 'opencode',
@@ -152,6 +161,7 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
     supportsSideQuestions: true,
     supportsSteering: false,
     supportsSessionCommands: false,
+    supportsSessionMcp: false,
   },
 };
 

@@ -14,6 +14,10 @@ import type {
   LLMProvider,
   NormalizedMessage,
   SessionCommandsSnapshot,
+  SessionMcpChange,
+  SessionMcpServer,
+  SessionMcpSnapshot,
+  SessionMcpTimeouts,
   SessionProcessSnapshot,
   WorkflowAgentActivity,
 } from '@/shared/types.js';
@@ -120,6 +124,35 @@ async function removeFileIfExists(filePath: string): Promise<boolean> {
 
 /** How long `getSessionCommands` waits on a process's `initialize` answer. */
 const SESSION_COMMANDS_TIMEOUT_MS = 10_000;
+
+/**
+ * How long a session's MCP routes wait on its CLI: a status read, and a
+ * reconnect or toggle. Mutable for tests only.
+ */
+export const SESSION_MCP_TIMEOUTS: SessionMcpTimeouts = { statusMs: 10_000, changeMs: 30_000 };
+
+/** The session a live-process route addresses, by app id or provider id; 404 without one. */
+function resolveLiveSession(sessionId: string) {
+  const session =
+    sessionsDb.getSessionById(sessionId) ?? sessionsDb.getSessionByProviderSessionId(sessionId);
+  if (!session) {
+    throw new AppError(`Session "${sessionId}" was not found.`, {
+      code: 'SESSION_NOT_FOUND',
+      statusCode: 404,
+    });
+  }
+  return session;
+}
+
+const mcpNotRunning = () => new AppError('The session has no live process to report its MCP servers.', {
+  code: 'SESSION_PROCESS_NOT_RUNNING',
+  statusCode: 409,
+});
+
+const mcpTimeout = () => new AppError('The session process did not answer about its MCP servers in time.', {
+  code: 'SESSION_MCP_TIMEOUT',
+  statusCode: 504,
+});
 
 /**
  * Archive rows need a stable project label even when the owning project is not
@@ -263,6 +296,66 @@ export const sessionsService = {
       });
     }
     return { ...snapshot, source: 'session', sessionId: session.session_id };
+  },
+
+  /**
+   * The MCP servers of a session's live process (by app id, falling back to
+   * the provider-native id), without their configuration. Never starts a
+   * process: without a live one the answer is 409.
+   */
+  async getSessionMcp(
+    sessionId: string,
+  ): Promise<SessionMcpSnapshot & { source: 'session'; sessionId: string }> {
+    const session = resolveLiveSession(sessionId);
+    const processes = providerRegistry.resolveProvider(session.provider).runtime.processes;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(mcpTimeout()), SESSION_MCP_TIMEOUTS.statusMs);
+    });
+    const snapshot = await Promise.race([processes?.mcp?.(session.session_id) ?? null, timeout])
+      .finally(() => clearTimeout(timer));
+    if (!snapshot) {
+      throw mcpNotRunning();
+    }
+    return { ...snapshot, source: 'session', sessionId: session.session_id };
+  },
+
+  /**
+   * Reconnects or toggles one MCP server of a session's live process and
+   * answers that server's status read again afterwards. One change at a time
+   * per process; never starts one.
+   */
+  async changeSessionMcp(
+    sessionId: string,
+    serverName: string,
+    change: SessionMcpChange,
+  ): Promise<{ server: SessionMcpServer; updatedAt: number }> {
+    const session = resolveLiveSession(sessionId);
+    const processes = providerRegistry.resolveProvider(session.provider).runtime.processes;
+    if (!processes?.changeMcp) {
+      throw mcpNotRunning();
+    }
+    const result = await processes.changeMcp(session.session_id, serverName, change, { ...SESSION_MCP_TIMEOUTS });
+    switch (result.outcome) {
+      case 'done':
+        return { server: result.server, updatedAt: result.updatedAt };
+      case 'not-running':
+        throw mcpNotRunning();
+      case 'not-found':
+        throw new AppError(`The session has no MCP server "${serverName}".`, {
+          code: 'MCP_SERVER_NOT_FOUND',
+          statusCode: 404,
+        });
+      case 'timeout':
+        throw mcpTimeout();
+      case 'failed':
+        throw new AppError(result.message || 'The MCP server could not be changed.', {
+          code: change.action === 'reconnect' ? 'MCP_RECONNECT_FAILED' : 'MCP_TOGGLE_FAILED',
+          statusCode: 502,
+        });
+      default:
+        throw new AppError('Unexpected MCP change outcome.', { code: 'INTERNAL_ERROR', statusCode: 500 });
+    }
   },
 
   /**
